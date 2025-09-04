@@ -1357,12 +1357,10 @@ uipc_soreceive_stream_or_seqpacket(struct socket *so, struct sockaddr **psa,
     struct uio *uio, struct mbuf **mp0, struct mbuf **controlp, int *flagsp)
 {
 	struct sockbuf *sb = &so->so_rcv;
-	struct mbuf *control, *m, *first, *last, *next;
+	struct mbuf *control, *m, *first, *last, *prev, *next;
 	u_int ctl, space, datalen, mbcnt, lastlen;
 	int error, flags;
 	bool nonblock, waitall, peek;
-
-	MPASS(mp0 == NULL);
 
 	if (psa != NULL)
 		*psa = NULL;
@@ -1394,7 +1392,7 @@ uipc_soreceive_stream_or_seqpacket(struct socket *so, struct sockaddr **psa,
 restart:
 	SOCK_RECVBUF_LOCK(so);
 	UIPC_STREAM_SBCHECK(sb);
-	while (sb->sb_acc < sb->sb_lowat &&
+	while (sb->sb_acc < uio->uio_resid && sb->sb_acc < sb->sb_lowat &&
 	    (sb->sb_ctl == 0 || controlp == NULL)) {
 		if (so->so_error) {
 			error = so->so_error;
@@ -1450,9 +1448,9 @@ restart:
 	 */
 	space = uio->uio_resid;
 	datalen = 0;
-	for (m = first, last = sb->uxst_fnrdy, lastlen = 0;
+	for (prev = NULL, m = first, last = sb->uxst_fnrdy, lastlen = 0;
 	     m != sb->uxst_fnrdy;
-	     m = STAILQ_NEXT(m, m_stailq)) {
+	     prev = m, m = STAILQ_NEXT(m, m_stailq)) {
 		if (m->m_type != MT_DATA) {
 			last = m;
 			lastlen = 0;
@@ -1610,33 +1608,59 @@ restart:
 		}
 	}
 
-	for (m = first; m != last; m = next) {
-		next = STAILQ_NEXT(m, m_stailq);
-		error = uiomove(mtod(m, char *), m->m_len, uio);
-		if (__predict_false(error)) {
-			SOCK_IO_RECV_UNLOCK(so);
+	if (mp0 == NULL) {
+		for (m = first; m != last; m = next) {
+			next = STAILQ_NEXT(m, m_stailq);
+			error = uiomove(mtod(m, char *), m->m_len, uio);
+			if (__predict_false(error)) {
+				SOCK_IO_RECV_UNLOCK(so);
+				if (!peek)
+					for (; m != last; m = next) {
+						next = STAILQ_NEXT(m, m_stailq);
+						m_free(m);
+					}
+				return (error);
+			}
 			if (!peek)
-				for (; m != last; m = next) {
-					next = STAILQ_NEXT(m, m_stailq);
-					m_free(m);
-				}
-			return (error);
+				m_free(m);
 		}
-		if (!peek)
-			m_free(m);
-	}
-	if (last != NULL && lastlen > 0) {
-		if (!peek) {
-			MPASS(!(m->m_flags & M_PKTHDR));
-			MPASS(last->m_data - M_START(last) >= lastlen);
-			error = uiomove(mtod(last, char *) - lastlen,
-			    lastlen, uio);
+		if (last != NULL && lastlen > 0) {
+			if (!peek) {
+				MPASS(!(last->m_flags & M_PKTHDR));
+				MPASS(last->m_data - M_START(last) >= lastlen);
+				error = uiomove(mtod(last, char *) - lastlen,
+				    lastlen, uio);
+			} else
+				error = uiomove(mtod(last, char *), lastlen,
+				    uio);
+			if (__predict_false(error)) {
+				SOCK_IO_RECV_UNLOCK(so);
+				return (error);
+			}
+		}
+	} else if (peek) {
+		*mp0 = m_copym(first, 0, datalen, M_WAITOK);
+		uio->uio_resid -= datalen;
+	} else {
+		if (last != NULL && lastlen > 0) {
+			MPASS(!(last->m_flags & M_PKTHDR));
+			m = m_get(M_WAITOK, last->m_type);
+			m->m_len = lastlen;
+			if (m->m_flags & (M_EXT | M_EXTPG)) {
+				m->m_data = last->m_data - lastlen;
+				mb_dupcl(m, last);
+			} else
+				bcopy(mtod(last, caddr_t) - lastlen,
+				    mtod(m, caddr_t), lastlen);
 		} else
-			error = uiomove(mtod(last, char *), lastlen, uio);
-		if (__predict_false(error)) {
-			SOCK_IO_RECV_UNLOCK(so);
-			return (error);
+			m = NULL;
+		if (prev == NULL)
+			*mp0 = m;
+		else {
+			STAILQ_NEXT(prev, m_stailq) = m;
+			*mp0 = first;
 		}
+		uio->uio_resid -= datalen;
 	}
 	if (waitall && !(flags & MSG_EOR) && uio->uio_resid > 0)
 		goto restart;
