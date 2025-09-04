@@ -1278,7 +1278,8 @@ restart:
 
 	MPASS(STAILQ_EMPTY(&mc.mc_q));
 
-	td->td_ru.ru_msgsnd++;
+	if (td != NULL)
+		td->td_ru.ru_msgsnd++;
 out4:
 	sorele(so2);
 out3:
@@ -1637,12 +1638,14 @@ restart:
 	}
 	if (waitall && !(flags & MSG_EOR) && uio->uio_resid > 0)
 		goto restart;
+
+	if (uio->uio_td != NULL)
+		uio->uio_td->td_ru.ru_msgrcv++;
+
 	SOCK_IO_RECV_UNLOCK(so);
 
 	if (flagsp != NULL)
 		*flagsp |= flags;
-
-	uio->uio_td->td_ru.ru_msgrcv++;
 
 	return (0);
 }
