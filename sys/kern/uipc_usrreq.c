@@ -980,19 +980,17 @@ uipc_peeraddr(struct socket *so, struct sockaddr *ret)
 static void
 uipc_reset_kernel_mbuf(struct mbuf *m, struct mchain *mc)
 {
-
-	M_ASSERTPKTHDR(m);
-
 	m_clrprotoflags(m);
-	m_tag_delete_chain(m, NULL);
-	m->m_pkthdr.rcvif = NULL;
-	m->m_pkthdr.flowid = 0;
-	m->m_pkthdr.csum_flags = 0;
-	m->m_pkthdr.fibnum = 0;
-	m->m_pkthdr.rsstype = 0;
-
 	mc_init_m(mc, m);
-	MPASS(m->m_pkthdr.len == mc->mc_len);
+	if (m->m_flags & M_PKTHDR) {
+		m_tag_delete_chain(m, NULL);
+		m->m_pkthdr.rcvif = NULL;
+		m->m_pkthdr.flowid = 0;
+		m->m_pkthdr.csum_flags = 0;
+		m->m_pkthdr.fibnum = 0;
+		m->m_pkthdr.rsstype = 0;
+		MPASS(m->m_pkthdr.len == mc->mc_len);
+	}
 }
 
 #ifdef SOCKBUF_DEBUG
