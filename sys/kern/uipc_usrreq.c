@@ -1189,7 +1189,9 @@ restart:
 		 * be put partially, but control is really a datagram.
 		 */
 		space = uipc_stream_sbspace(sb);
-		if (space < sb->sb_lowat || space < cmc.mc_len) {
+		if (space < mc.mc_len + cmc.mc_len &&
+		    (m || sosendallatonce(so) || space < sb->sb_lowat ||
+		    space < cmc.mc_len)) {
 			if (nonblock) {
 				if (aio)
 					sb->uxst_flags |= UXST_PEER_AIO;
