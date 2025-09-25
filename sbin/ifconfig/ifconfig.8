@@ -28,7 +28,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd October 12, 2025
+.Dd October 15, 2025
 .Dt IFCONFIG 8
 .Os
 .Sh NAME
@@ -3287,9 +3287,20 @@ make one host advertise slower than another host.
 It is specified in 1/256 of seconds.
 The acceptable values are 1 to 254.
 The default value is 0.
+.It Cm key Ar text
+Set the authentication key to the string
+.Ar text .
+The string must be shorter than 20 characters.
+.It Cm keyhex Ar key
+Set the authentication key to the 40-character hexadecimal string
+.Ar key .
+.It Cm keypass Ar phrase
+Set the authentication key using a SHA-256-based key derivation of
+.Ar phrase .
 .It Cm pass Ar phrase
 Set the authentication key to
 .Ar phrase .
+This silently truncates to 19 characters and is provided for compatibility.
 .It Cm state Ar state
 Forcibly change state of a given vhid.
 The following states are recognized:

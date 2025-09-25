@@ -66,7 +66,7 @@ CFLAGS+= -DINET
 CFLAGS+= -DJAIL
 LIBADD+=	jail
 .endif
-LIBADD+=	nv
+LIBADD+=	md nv
 
 .if ${MK_NETLINK_SUPPORT} != "no"
 SRCS+=	ifconfig_netlink.c

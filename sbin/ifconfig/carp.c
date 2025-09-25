@@ -44,6 +44,7 @@
 #include <arpa/inet.h>
 
 #include <ctype.h>
+#include <sha256.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -67,10 +68,42 @@ static int carpr_advbase = -1;
 static int carpr_state = -1;
 static struct in_addr carp_addr;
 static struct in6_addr carp_addr6;
-static unsigned char const *carpr_key;
+static bool have_carpr_key;
+/* The digest will be truncated to the key length. */
+_Static_assert(CARP_KEY_LEN <= SHA256_DIGEST_LENGTH, "");
+static unsigned char carpr_key[SHA256_DIGEST_LENGTH];
 static carp_version_t carpr_version;
 static uint8_t carpr_vrrp_prio;
 static uint16_t carpr_vrrp_adv_inter;
+
+static void
+printkey(const unsigned char key[CARP_KEY_LEN])
+{
+	const unsigned char *p = key;
+	const unsigned char *end = key + CARP_KEY_LEN;
+	bool text = true;
+
+	/*
+	 * Is this key text or binary?  If everything up to the first nul is
+	 * printable and the rest is nul, print as text.  Otherwise, print as
+	 * hex.
+	 *
+	 * A terminating nul must be present in the key for it to be printed as
+	 * text.  This ensures the key can be set using the displayed string.
+	 */
+	while (p != end && *p != '\0' && (text = isprint(*p++)))
+		/* printable */;
+	while (text && p != end && (text = *p++ == '\0'))
+		/* nul */;
+	if (text && *(end - 1) == '\0')
+		printf(" key \"%s\"\n", key);
+	else {
+		printf(" keyhex ");
+		for (int i = 0; i < CARP_KEY_LEN; i++)
+			printf("%02x", key[i]);
+		printf("\n");
+	}
+}
 
 static void
 carp_status(if_ctx *ctx)
@@ -87,8 +120,8 @@ carp_status(if_ctx *ctx)
 			printf("\tcarp: %s vhid %d advbase %d advskew %d",
 			    carp_states[carpr[i].carpr_state], carpr[i].carpr_vhid,
 			    carpr[i].carpr_advbase, carpr[i].carpr_advskew);
-			if (ctx->args->printkeys && carpr[i].carpr_key[0] != '\0')
-				printf(" key \"%s\"\n", carpr[i].carpr_key);
+			if (ctx->args->printkeys)
+				printkey(carpr[i].carpr_key);
 			else
 				printf("\n");
 
@@ -135,9 +168,8 @@ setcarp_callback(if_ctx *ctx, void *arg __unused)
 	}
 
 	carpr.carpr_vhid = carpr_vhid;
-	if (carpr_key != NULL)
-		/* XXX Should hash the password into the key here? */
-		strlcpy(carpr.carpr_key, carpr_key, CARP_KEY_LEN);
+	if (have_carpr_key)
+		memcpy(carpr.carpr_key, carpr_key, CARP_KEY_LEN);
 	if (carpr_advskew > -1)
 		carpr.carpr_advskew = carpr_advskew;
 	if (carpr_advbase > -1)
@@ -161,13 +193,61 @@ setcarp_callback(if_ctx *ctx, void *arg __unused)
 }
 
 static void
-setcarp_passwd(if_ctx *ctx __unused, const char *val, int dummy __unused)
+setcarp_key(if_ctx *ctx __unused, const char *val, int dummy __unused)
+{
+	if (carpr_vhid == -1)
+		errx(1, "key requires vhid");
+
+	if (strlcpy((char *)carpr_key, val, CARP_KEY_LEN) >= CARP_KEY_LEN)
+		errx(1, "key must be shorter than %d characters", CARP_KEY_LEN);
+	have_carpr_key = true;
+}
+
+static void
+setcarp_keyhex(if_ctx *ctx __unused, const char *val, int dummy __unused)
+{
+	if (carpr_vhid == -1)
+		errx(1, "keyhex requires vhid");
+
+	for (int i = 0; i < CARP_KEY_LEN; i++) {
+		char byte[3];
+		int pos = i * 2;
+
+		if ((byte[0] = val[pos]) == '\0' ||
+		    (byte[1] = val[pos + 1]) == '\0')
+			errx(1, "keyhex must be a 20-byte hex digest");
+		byte[2] = '\0';
+		errno = 0;
+		if ((carpr_key[i] = strtol(byte, NULL, 16)) == 0 && errno != 0)
+			errx(1, "keyhex must be a 20-byte hex digest");
+	}
+	have_carpr_key = true;
+}
+
+static void
+setcarp_keypass(if_ctx *ctx __unused, const char *val, int dummy __unused)
+{
+	SHA256_CTX sha_ctx;
+
+	if (carpr_vhid == -1)
+		errx(1, "keypass requires vhid");
+
+	SHA256_Init(&sha_ctx);
+	SHA256_Update(&sha_ctx, val, strlen(val));
+	SHA256_Final(carpr_key, &sha_ctx);
+	have_carpr_key = true;
+}
+
+static void
+setcarp_pass(if_ctx *ctx __unused, const char *val, int dummy __unused)
 {
 
 	if (carpr_vhid == -1)
-		errx(1, "passwd requires vhid");
+		errx(1, "pass requires vhid");
 
-	carpr_key = val;
+	/* XXX: silently truncates, not hashed, retained for compatibility */
+	strlcpy((char *)carpr_key, val, CARP_KEY_LEN);
+	have_carpr_key = true;
 }
 
 static void
@@ -272,7 +352,10 @@ setvrrp_interval(if_ctx *ctx __unused, const char *val, int dummy __unused)
 static struct cmd carp_cmds[] = {
 	DEF_CMD_ARG("advbase",	setcarp_advbase),
 	DEF_CMD_ARG("advskew",	setcarp_advskew),
-	DEF_CMD_ARG("pass",	setcarp_passwd),
+	DEF_CMD_ARG("key",	setcarp_key),
+	DEF_CMD_ARG("keyhex",	setcarp_keyhex),
+	DEF_CMD_ARG("keypass",	setcarp_keypass),
+	DEF_CMD_ARG("pass",	setcarp_pass),
 	DEF_CMD_ARG("vhid",	setcarp_vhid),
 	DEF_CMD_ARG("state",	setcarp_state),
 	DEF_CMD_ARG("peer",	setcarp_peer),
