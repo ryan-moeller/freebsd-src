@@ -53,6 +53,21 @@ ck_pr_barrier(void)
  */
 #include "ck_f_pr.h"
 
+#ifdef COMPAT_LIB32
+#undef CK_F_PR_ADD_64
+#undef CK_F_PR_AND_64
+#undef CK_F_PR_CAS_64
+#undef CK_F_PR_CAS_64_VALUE
+#undef CK_F_PR_DEC_64
+#undef CK_F_PR_FAA_64
+#undef CK_F_PR_INC_64
+#undef CK_F_PR_LOAD_64
+#undef CK_F_PR_OR_64
+#undef CK_F_PR_STORE_64
+#undef CK_F_PR_SUB_64
+#undef CK_F_PR_XOR_64
+#endif
+
 #define CK_PR_ACCESS(x) (*(volatile __typeof__(x) *)&(x))
 
 #define CK_PR_LOAD(S, M, T)		 			\
@@ -200,7 +215,9 @@ ck_pr_cas_ptr_value(void *target, void *compare, void *set, void *v)
 CK_PR_CAS_O(char, char)
 CK_PR_CAS_O(int, int)
 CK_PR_CAS_O(uint, unsigned int)
+#ifndef COMPAT_LIB32
 CK_PR_CAS_O(64, uint64_t)
+#endif
 CK_PR_CAS_O(32, uint32_t)
 CK_PR_CAS_O(16, uint16_t)
 CK_PR_CAS_O(8,  uint8_t)
@@ -225,7 +242,9 @@ CK_PR_FAA(ptr, void, void *)
 CK_PR_FAA_S(char, char)
 CK_PR_FAA_S(uint, unsigned int)
 CK_PR_FAA_S(int, int)
+#ifndef COMPAT_LIB32
 CK_PR_FAA_S(64, uint64_t)
+#endif
 CK_PR_FAA_S(32, uint32_t)
 CK_PR_FAA_S(16, uint16_t)
 CK_PR_FAA_S(8,  uint8_t)
@@ -246,6 +265,16 @@ CK_PR_FAA_S(8,  uint8_t)
 
 #define CK_PR_BINARY_S(K, S, T) CK_PR_BINARY(K, S, T, T)
 
+#ifdef COMPAT_LIB32
+#define CK_PR_GENERATE(K)			\
+	CK_PR_BINARY(K, ptr, void, void *)	\
+	CK_PR_BINARY_S(K, char, char)		\
+	CK_PR_BINARY_S(K, int, int)		\
+	CK_PR_BINARY_S(K, uint, unsigned int)	\
+	CK_PR_BINARY_S(K, 32, uint32_t)		\
+	CK_PR_BINARY_S(K, 16, uint16_t)		\
+	CK_PR_BINARY_S(K, 8, uint8_t)
+#else
 #define CK_PR_GENERATE(K)			\
 	CK_PR_BINARY(K, ptr, void, void *)	\
 	CK_PR_BINARY_S(K, char, char)		\
@@ -255,6 +284,7 @@ CK_PR_FAA_S(8,  uint8_t)
 	CK_PR_BINARY_S(K, 32, uint32_t)		\
 	CK_PR_BINARY_S(K, 16, uint16_t)		\
 	CK_PR_BINARY_S(K, 8, uint8_t)
+#endif
 
 CK_PR_GENERATE(add)
 CK_PR_GENERATE(sub)
@@ -286,7 +316,9 @@ CK_PR_UNARY(ptr, void, void *)
 CK_PR_UNARY_S(char, char)
 CK_PR_UNARY_S(int, int)
 CK_PR_UNARY_S(uint, unsigned int)
+#ifndef COMPAT_LIB32
 CK_PR_UNARY_S(64, uint64_t)
+#endif
 CK_PR_UNARY_S(32, uint32_t)
 CK_PR_UNARY_S(16, uint16_t)
 CK_PR_UNARY_S(8, uint8_t)

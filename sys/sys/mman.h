@@ -263,6 +263,7 @@ typedef	__size_t	size_t;
 #include <vm/vm.h>
 
 struct file;
+struct rio_softc;
 
 struct shmfd {
 	vm_ooffset_t	shm_size;
@@ -286,6 +287,8 @@ struct shmfd {
 
 	struct label	*shm_label;		/* MAC label */
 	const char	*shm_path;
+
+	struct rio_softc *shm_rio;
 
 	struct rangelock shm_rl;
 	struct mtx	shm_mtx;
