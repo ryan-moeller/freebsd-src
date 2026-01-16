@@ -48,7 +48,7 @@
 #endif
 
 #if !CK_USE_CC_BUILTINS
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !defined(COMPAT_LIB32)
 #include "gcc/x86_64/ck_pr.h"
 #elif defined(__x86__)
 #include "gcc/x86/ck_pr.h"

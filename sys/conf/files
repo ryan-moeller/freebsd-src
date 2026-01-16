@@ -405,6 +405,7 @@ contrib/ck/src/ck_barrier_combining.c			standard compile-with "${NORMAL_C} -I$S/
 contrib/ck/src/ck_barrier_dissemination.c		standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 contrib/ck/src/ck_barrier_mcs.c				standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 contrib/ck/src/ck_barrier_tournament.c			standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
+contrib/ck/src/ck_ec.c					standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 contrib/ck/src/ck_epoch.c				standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 contrib/ck/src/ck_hp.c					standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 contrib/ck/src/ck_hs.c					standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
@@ -3903,6 +3904,7 @@ kern/kern_racct.c		optional racct
 kern/kern_rangelock.c		standard
 kern/kern_rctl.c		standard
 kern/kern_resource.c		standard
+kern/kern_rio.c			standard compile-with "${NORMAL_C} -I$S/contrib/ck/include"
 kern/kern_rmlock.c		standard
 kern/kern_rwlock.c		standard
 kern/kern_sdt.c			optional kdtrace_hooks

@@ -73,6 +73,7 @@
 #include <sys/proc.h>
 #include <sys/refcount.h>
 #include <sys/resourcevar.h>
+#include <sys/rio.h>
 #include <sys/rwlock.h>
 #include <sys/sbuf.h>
 #include <sys/stat.h>
@@ -173,6 +174,9 @@ const struct fileops shm_ops = {
 	.fo_cmp = file_kcmp_generic,
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE,
 };
+
+fo_ioctl_t *rio_ioctl;
+void (*rio_destroy)(struct rio_softc *);
 
 FEATURE(posix_shm, "POSIX shared memory");
 
@@ -601,6 +605,12 @@ shm_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
 		conf->alloc_policy = shmfd->shm_lp_alloc_policy;
 		shm_rangelock_unlock(shmfd, rl_cookie);
 		return (0);
+	case FIORIOCONFIGURE:
+	case FIORIOSUBMIT:
+		/* TODO: avoid race */
+		if (rio_ioctl != NULL)
+			return (rio_ioctl(fp, com, data, active_cred, td));
+		/* FALLTHROUGH */
 	default:
 		return (ENOTTY);
 	}
@@ -965,6 +975,9 @@ shm_drop(struct shmfd *shmfd)
 	vm_object_t obj;
 
 	if (refcount_release(&shmfd->shm_refs)) {
+		/* TODO: avoid race */
+		if (shmfd->shm_rio != NULL && rio_destroy != NULL)
+			rio_destroy(shmfd->shm_rio);
 #ifdef MAC
 		mac_posixshm_destroy(shmfd);
 #endif
