@@ -64,7 +64,7 @@ CK_RING_PROTOTYPE(rio, rio_slot)
 
 /*
  * TODO: replace ck_ring_t and ck_ec32_t with an ABI-stable version combining
- * ring and wait/wake words (head and tail become the event counters)
+ * ring and wait/wake words (head and tail become the event counters)?
  */
 struct rio_ring {
 	ck_ring_t	rr_ring;	/* queue ring */
@@ -106,8 +106,11 @@ rio_config_size(const struct rio_config *conf)
 
 #ifdef _KERNEL
 #include <sys/file.h>
+#include <sys/sx.h>
 
 struct rio_softc;
+
+extern struct sx rio_module_lock;
 
 extern fo_ioctl_t *rio_ioctl;
 extern void (*rio_destroy)(struct rio_softc *);
