@@ -28,6 +28,7 @@
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/umtxvar.h>
 #include <sys/user.h>
@@ -47,8 +48,77 @@
 
 static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 
+static int
+rio_ec_gettime(const struct ck_ec_ops *ops __unused, struct timespec *out)
+{
+	/* TODO: revisit which clock source to use, this is CLOCK_MONOTONIC */
+	nanouptime(out);
+	return (0);
+}
+
+static void
+rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
+    uint32_t expected, const struct timespec *deadline)
+{
+	struct umtx_abs_timeout uto, *utop;
+	struct umtx_q *uq;
+	uint32_t value;
+	int error;
+
+	/* This implementation is largely informed by kern_umtq.c:do_wait(). */
+	uq = curthread->td_umtxq;
+	if ((error = umtx_key_get(address, TYPE_SIMPLE_WAIT, AUTO_SHARE,
+	    &uq->uq_key)) != 0) {
+		/* TODO: handle error somehow */
+		return;
+	}
+	if (deadline == NULL) {
+		utop = NULL;
+	} else {
+		/* TODO: revisit which clock source to use */
+		umtx_abs_timeout_init(&uto, CLOCK_MONOTONIC, true, deadline);
+		utop = &uto;
+	}
+	umtxq_lock(&uq->uq_key);
+	umtxq_insert(uq);
+	umtxq_unlock(&uq->uq_key);
+	error = fueword32(address, &value);
+	umtxq_lock(&uq->uq_key);
+	if (error == 0 && value == expected) {
+		error = umtxq_sleep(uq, "riowait", utop);
+	}
+	if ((uq->uq_flags & UQF_UMTXQ) != 0) {
+		umtxq_remove(uq);
+	}
+	umtxq_unlock(&uq->uq_key);
+	umtx_key_release(&uq->uq_key);
+	switch (error) {
+	case 0:
+	case ETIMEDOUT:
+		break;
+	default:
+		/* TODO: handle error somehow */
+		break;
+	}
+}
+
+static void
+rio_ec_umtx_wake(const struct ck_ec_ops *ops __unused, const uint32_t *address)
+{
+	/* TODO: error handling? is curthread correct? */
+	kern_umtx_wake(curthread, __DECONST(uint32_t *, address), INT_MAX, 0);
+}
+
+static const struct ck_ec_ops rio_ec_umtx_ops = {
+	.gettime = rio_ec_gettime,
+	.wait32 = rio_ec_umtx_wait,
+	.wake32 = rio_ec_umtx_wake,
+	/* TODO: tune/override default options for ABI stability */
+};
+
 static const struct ck_ec_mode rio_ec_umtx_mode = {
-	/* TODO: implement the umtx mode (hard?) */
+	.ops = &rio_ec_umtx_ops,
+	.single_producer = false,
 };
 
 typedef int rio_src_scheduler_f(struct rio_softc *);
