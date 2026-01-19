@@ -4,6 +4,8 @@
  * Copyright (c) 2026 Ryan Moeller
  */
 
+#include "opt_rio.h"
+
 #define EXTERR_CATEGORY EXTERR_CAT_RIO
 #include <sys/param.h>
 #include <sys/bitstring.h>
@@ -140,15 +142,18 @@ static const u_int rio_flow_sync_workers = 4;
 /* Deferred softc destruction. */
 static struct taskqueue *rio_doom;
 
-static boolean_t rio_shutdown_;
-
-_Static_assert(sizeof(rio_shutdown_) == sizeof(int),
-    "rio_shutdown_ must be int-sized for atomic use");
+/* Shutdown handling. */
+static struct sx rio_shutdown_lock;
+SX_SYSINIT_FLAGS(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
+    SX_DUPOK);
+static boolean_t rio_shutdown_pending;
+_Static_assert(sizeof(rio_shutdown_pending) == sizeof(int),
+    "rio_shutdown_pending must be int-sized for atomic use");
 
 static inline bool
 rio_shuttingdown(void)
 {
-	return (atomic_load_acq_int(&rio_shutdown_));
+	return (atomic_load_acq_int(&rio_shutdown_pending));
 }
 
 /* kernel-private IO control block */
@@ -270,11 +275,11 @@ rio_destroy_task(void *arg, int pending __unused)
 	counter_u64_free(sc->sc_inflight);
 	free(sc->sc_io, M_RIO);
 	free(sc, M_RIO);
-	sx_sunlock(&rio_module_lock);
+	sx_sunlock(&rio_shutdown_lock);
 }
 
-static void
-rio_destroy_impl(struct rio_softc *sc)
+void
+rio_destroy(struct rio_softc *sc)
 {
 	atomic_store_rel_int(&sc->sc_doomed, true);
 	smp_rendezvous(NULL, NULL, NULL, NULL);
@@ -306,13 +311,15 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	if (conf->rio_policy_id >= nitems(rio_src_policies)) {
 		return (EINVAL);
 	}
-	sx_slock(&rio_module_lock);
+	if (sx_try_slock(&rio_shutdown_lock) == 0 || rio_shuttingdown()) {
+		return (ESHUTDOWN);
+	}
 	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
 	size = rio_config_size(conf);
 	/* TODO: Will mmap enforce size limits for us? */
 	if ((error = shm_map(fp, size, 0, (void **)&sc->sc_rio)) != 0) {
 		free(sc, M_RIO);
-		sx_sunlock(&rio_module_lock);
+		sx_sunlock(&rio_shutdown_lock);
 		return (error);
 	}
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
@@ -354,9 +361,9 @@ rio_submit(struct file *fp, struct thread *td)
 	return (schedule(sc));
 }
 
-static int
-rio_ioctl_impl(struct file *fp, u_long com, void *data,
-    struct ucred *active_cred, struct thread *td)
+int
+rio_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
+    struct thread *td)
 {
 	switch (com) {
 	case FIORIOCONFIGURE:
@@ -1133,8 +1140,6 @@ rio_load(void)
 	    taskqueue_thread_enqueue, &rio_doom);
 	taskqueue_start_threads(&rio_doom, 1, PWAIT, "rio doom taskq");
 
-	rio_destroy = rio_destroy_impl;
-	rio_ioctl = rio_ioctl_impl;
 	rio_src_zone = rio_zcreate("rio src", sizeof(struct rio_src));
 	rio_srcio_zone = rio_zcreate("rio src+io", sizeof(struct rio_srcio));
 	/* TODO: register process_* event handlers */
@@ -1196,10 +1201,9 @@ rio_shutdown(void)
 {
 	u_int cpu;
 
-	atomic_store_rel_int(&rio_shutdown_, true);
-	rio_destroy = NULL;
-	rio_ioctl = NULL;
-	/* TODO: ensure none of this is in use! softc semaphore? */
+	sx_xlock(&rio_shutdown_lock);
+	atomic_store_rel_int(&rio_shutdown_pending, true);
+	sx_xunlock(&rio_shutdown_lock);
 	CPU_FOREACH(cpu) {
 		struct rio_flow *flow;
 
@@ -1223,9 +1227,6 @@ rio_modload(struct module *module, int cmd, void *arg)
 {
 	int error = 0;
 
-	if (sx_try_xlock(&rio_module_lock) == 0) {
-		return (EBUSY);
-	}
 	switch (cmd) {
 	case MOD_LOAD:
 		error = rio_load();
@@ -1237,7 +1238,6 @@ rio_modload(struct module *module, int cmd, void *arg)
 		error = EOPNOTSUPP;
 		break;
 	}
-	sx_xunlock(&rio_module_lock);
 	return (error);
 }
 

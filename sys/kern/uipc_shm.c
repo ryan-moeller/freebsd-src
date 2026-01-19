@@ -50,6 +50,7 @@
 #include <sys/cdefs.h>
 #include "opt_capsicum.h"
 #include "opt_ktrace.h"
+#include "opt_rio.h"
 
 #include <sys/param.h>
 #include <sys/capsicum.h>
@@ -174,13 +175,6 @@ const struct fileops shm_ops = {
 	.fo_cmp = file_kcmp_generic,
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE,
 };
-
-/* Block module unload until all handles are destroyed. */
-struct sx rio_module_lock;
-SX_SYSINIT_FLAGS(rio_module_lock, &rio_module_lock, "rio module lock",
-    SX_DUPOK);
-fo_ioctl_t *rio_ioctl;
-void (*rio_destroy)(struct rio_softc *);
 
 FEATURE(posix_shm, "POSIX shared memory");
 
@@ -569,7 +563,6 @@ shm_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
 	struct shmfd *shmfd;
 	struct shm_largepage_conf *conf;
 	void *rl_cookie;
-	int error;
 
 	shmfd = fp->f_data;
 	switch (com) {
@@ -610,15 +603,11 @@ shm_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
 		conf->alloc_policy = shmfd->shm_lp_alloc_policy;
 		shm_rangelock_unlock(shmfd, rl_cookie);
 		return (0);
+#ifdef RIO
 	case FIORIOCONFIGURE:
 	case FIORIOSUBMIT:
-		if (sx_try_slock(&rio_module_lock) == 0 ||
-		    rio_ioctl == NULL) {
-			return (ENOTTY);
-		}
-		error = rio_ioctl(fp, com, data, active_cred, td);
-		sx_sunlock(&rio_module_lock);
-		return (error);
+		return (rio_ioctl(fp, com, data, active_cred, td));
+#endif
 	default:
 		return (ENOTTY);
 	}
@@ -983,13 +972,9 @@ shm_drop(struct shmfd *shmfd)
 	vm_object_t obj;
 
 	if (refcount_release(&shmfd->shm_refs)) {
-		if (shmfd->shm_rio != NULL) {
-			if (sx_try_slock(&rio_module_lock) != 0) {
-				if (rio_destroy != NULL)
-					rio_destroy(shmfd->shm_rio);
-				sx_sunlock(&rio_module_lock);
-			}
-		}
+#ifdef RIO
+		rio_destroy(shmfd->shm_rio);
+#endif
 #ifdef MAC
 		mac_posixshm_destroy(shmfd);
 #endif

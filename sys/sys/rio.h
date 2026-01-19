@@ -106,14 +106,13 @@ rio_config_size(const struct rio_config *conf)
 
 #ifdef _KERNEL
 #include <sys/file.h>
-#include <sys/sx.h>
 
 struct rio_softc;
 
-extern struct sx rio_module_lock;
-
-extern fo_ioctl_t *rio_ioctl;
-extern void (*rio_destroy)(struct rio_softc *);
+#ifdef RIO
+fo_ioctl_t rio_ioctl;
+void rio_destroy(struct rio_softc *);
+#endif
 #else
 #include <sys/cdefs.h>
 

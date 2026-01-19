@@ -1184,6 +1184,9 @@ options 	MD_ROOT_MEM
 # Disk quotas are supported when this option is enabled.
 options 	QUOTA			#enable disk quotas
 
+# Ring Input/Output is a lock-free user I/O submission and completion path.
+options		RIO
+
 # If you are running a machine just as a fileserver for PC and MAC
 # users, using SAMBA, you may consider setting this option
 # and keeping all those users' directories on a filesystem that is
