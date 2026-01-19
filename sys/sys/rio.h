@@ -14,7 +14,7 @@
 
 /* scheduling policies */
 #define RIO_POLICY_NONE	0
-/* TBD */
+/* TBD (perhaps a policy that creates a dedicated polling kernel thread?) */
 
 /* RIO ioctls */
 struct rio_config {
@@ -105,52 +105,14 @@ rio_config_size(const struct rio_config *conf)
 }
 
 #ifdef _KERNEL
+#ifdef RIO
 #include <sys/file.h>
 
 struct rio_softc;
 
-#ifdef RIO
 fo_ioctl_t rio_ioctl;
 void rio_destroy(struct rio_softc *);
-#endif
-#else
-#include <sys/cdefs.h>
-
-/* TODO: this part goes in librio */
-/*
- * With SHM the user must do the following:
- *
- * size = rio_config_size(config)
- * fd = shm_open(SHM_ANON, O_CLOFORK | O_CLOEXEC, 0)
- * ftruncate(fd, size)
- * rio = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
- * minherit(rio, size, INHERIT_NONE)
- * ioctl(fd, FIORIOCONFIGURE, config)
- * <enqueue control blocks to submission ring>
- * ioctl(fd, FIORIOSUBMIT)
- * <dequeue control blocks from completion ring>
- * munmap(rio, size)
- * close(fd)
- *
- * librio handles those details and provides a simpler API.
- */
-struct _rio {
-	struct rio	*rio_mapped;		/* mapped memory region */
-	struct rio_ring	rio_freelist;		/* control blocks freelist */
-	struct rio_slot *rio_freelist_slots;	/* freelist slots */
-	struct rio_slot *rio_submission_slots;	/* pointer into mapped */
-	struct rio_slot *rio_completion_slots;	/* pointer into mapped */
-	int		rio_fd;			/* SHM file descriptor */
-};
-
-typedef struct _rio *rio_t;
-
-__BEGIN_DECLS
-int rio_create(rio_t *rio, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid);
-/* TODO: queue manipulation ops in all their variety */
-int rio_submit(rio_t *rio, const struct rio_policy *policy);
-int rio_destroy(rio_t *rio);
-__END_DECLS
-#endif /* !_KERNEL */
+#endif /* RIO */
+#endif /* _KERNEL */
 
 #endif /* !_SYS_RIO_H_ */

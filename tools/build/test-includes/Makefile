@@ -22,6 +22,11 @@ NO_PIC=	yes
 # Some files have to be clean for extra defines too...
 CFLAGS.event.c=	-D_WANT_KEVENT32 -D_WANT_FREEBSD11_KEVENT
 
+# XXX: Temporary workaround while prototyping with CK
+CFLAGS.sys_rio.c= \
+	-I/home/ryan/ck/include \
+	-I/home/ryan/ck/include/x86_64
+
 # We currently support C89 and newer compilers. Catch the odd little fussy
 # details like __inline that the header files must follow to support C89.
 CFLAGS+=-ansi
