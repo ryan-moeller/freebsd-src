@@ -156,7 +156,8 @@ rio_create(rio_t *riop, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid)
 		error = errno;
 		goto error_free;
 	}
-	if ((fd = shm_open(SHM_ANON, O_CLOEXEC | O_CLOFORK, 0)) == -1) {
+	if ((fd = shm_open(SHM_ANON, O_RDWR | O_CLOEXEC | O_CLOFORK | O_CREAT,
+	    0)) == -1) {
 		error = errno;
 		goto error_free;
 	}
