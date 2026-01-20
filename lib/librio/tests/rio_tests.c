@@ -36,7 +36,9 @@ ATF_TC_BODY(polling, tc)
 	int fd;
 
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
-	ATF_REQUIRE((fd = open("testfile", O_CREAT, 0444)) != -1);
+	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
+
+	/* Write a string to the file. */
 	ATF_CHECK(rio_write(rio, fd, "test", 4, NULL) == 0);
 	ATF_CHECK(rio_submit(rio) == 0);
 	ATF_CHECK((iocb = rio_poll(rio, NULL)) != NULL);
@@ -45,6 +47,8 @@ ATF_TC_BODY(polling, tc)
 	ATF_CHECK_INTEQ(iocb->rio_status, 4);
 	ATF_CHECK_INTEQ(iocb->rio_error, 0);
 	rio_return(rio, iocb);
+
+	/* Read back the string we wrote. */
 	ATF_CHECK(rio_read(rio, fd, buf, 4, NULL) == 0);
 	ATF_CHECK(rio_submit(rio) == 0);
 	ATF_CHECK((iocb = rio_poll(rio, NULL)) != NULL);
@@ -54,6 +58,7 @@ ATF_TC_BODY(polling, tc)
 	ATF_CHECK_INTEQ(iocb->rio_error, 0);
 	rio_return(rio, iocb);
 	ATF_CHECK_STREQ(buf, "test");
+
 	ATF_CHECK(close(fd) == 0);
 	rio_destroy(rio);
 }
