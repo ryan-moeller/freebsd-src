@@ -618,7 +618,7 @@ rio_srcio_read(struct rio_srcio *srcio)
 	/* We're not AIO, but close enough. */
 	vmspace_switch_aio(p->p_vmspace);
 	switch ((kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred,
-	    (flags & RIO_FOFFSET) == 0 ? 0 : FOF_OFFSET, td))) {
+	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
 	case 0:
 	case ERESTART:
 	case EINTR:
@@ -676,7 +676,7 @@ rio_srcio_write(struct rio_srcio *srcio)
 	/* We're not AIO, but close enough. */
 	vmspace_switch_aio(p->p_vmspace);
 	switch ((kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred,
-	    (flags & RIO_FOFFSET) == 0 ? 0 : FOF_OFFSET, td))) {
+	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
 	case EPIPE:
 		PROC_LOCK(p);
 		kern_psignal(p, SIGPIPE);
