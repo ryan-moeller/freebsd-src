@@ -897,6 +897,27 @@ rio_selector_insert(struct rio_selector *sel, struct rio_srcio *srcio,
 }
 
 static inline void
+rio_selector_destroy(struct rio_selector *sel)
+{
+	free(sel->rs_empty, M_RIO);
+	free(sel->rs_affine, M_RIO);
+	free(sel->rs_minimum, M_RIO);
+	free(sel->rs_candidates, M_RIO);
+	free(sel->rs_indices, M_RIO);
+}
+
+#define UIMAX(...) ({ \
+	u_int _vals[] = {__VA_ARGS__}; \
+	u_int _max = 0; \
+	for (u_int _i = 0; _i < nitems(_vals); _i++) { \
+		if (_vals[_i] > _max) { \
+		    _max = _vals[_i]; \
+		} \
+	} \
+	_max; \
+})
+
+static inline void
 bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 {
 	size_t n = bitstr_size(len);
@@ -906,9 +927,24 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 	}
 }
 
-static inline struct rio_worker *
-rio_selector_ideal(struct rio_selector *sel, struct rio_worker *workers, int x)
+struct rio_scheduler {
+	struct rio_selector	rs_sel;
+	int	*rs_seq;	/* XXX: stale reads should be good enough */
+};
+
+static inline void
+rio_scheduler_init(struct rio_scheduler *sched, struct rio_issuer *issuer)
 {
+	sched->rs_seq = &issuer->ri_seq;
+	rio_selector_init(&sched->rs_sel, UIMAX(rio_flow_read_workers,
+	    rio_flow_write_workers, rio_flow_sync_workers));
+	/* TODO: more worker classes */
+}
+
+static inline struct rio_worker *
+rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
+{
+	struct rio_selector *sel = &sched->rs_sel;
 	u_int count, idx;
 
 	bit_nclear(sel->rs_candidates, 0, sel->rs_n);
@@ -920,12 +956,13 @@ rio_selector_ideal(struct rio_selector *sel, struct rio_worker *workers, int x)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[x % count]);
+	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
 
 static inline struct rio_worker *
-rio_selector_empty(struct rio_selector *sel, struct rio_worker *workers, int x)
+rio_scheduler_empty(struct rio_scheduler *sched, struct rio_worker *workers)
 {
+	struct rio_selector *sel = &sched->rs_sel;
 	u_int count, idx;
 
 	count = 0;
@@ -935,12 +972,13 @@ rio_selector_empty(struct rio_selector *sel, struct rio_worker *workers, int x)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[x % count]);
+	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
 
 static inline struct rio_worker *
-rio_selector_affine(struct rio_selector *sel, struct rio_worker *workers, int x)
+rio_scheduler_affine(struct rio_scheduler *sched, struct rio_worker *workers)
 {
+	struct rio_selector *sel = &sched->rs_sel;
 	u_int min, count, idx;
 
 	bit_nclear(sel->rs_candidates, 0, sel->rs_n);
@@ -964,14 +1002,16 @@ rio_selector_affine(struct rio_selector *sel, struct rio_worker *workers, int x)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[x % count]);
+	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
 
 static inline struct rio_worker *
-rio_selector_depth(struct rio_selector *sel, struct rio_worker *workers, int x)
+rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
 {
+	struct rio_selector *sel = &sched->rs_sel;
 	u_int count, idx;
 
+	/* TODO: policy depth threshold to consider remote workers */
 	count = 0;
 	bit_foreach(sel->rs_minimum, sel->rs_n, idx) {
 		sel->rs_indices[count++] = idx;
@@ -979,20 +1019,17 @@ rio_selector_depth(struct rio_selector *sel, struct rio_worker *workers, int x)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[x % count]);
+	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
-
-/* TODO: remote flow selection process */
 
 static inline void
-rio_selector_free(struct rio_selector *sel)
+rio_scheduler_destroy(struct rio_scheduler *sched)
 {
-	free(sel->rs_empty, M_RIO);
-	free(sel->rs_affine, M_RIO);
-	free(sel->rs_minimum, M_RIO);
-	free(sel->rs_candidates, M_RIO);
-	free(sel->rs_indices, M_RIO);
+	rio_selector_destroy(&sched->rs_sel);
 }
+
+
+/* TODO: remote flow selection process */
 
 struct rio_flow {
 	struct rio_issuer rf_issuer;
@@ -1043,33 +1080,51 @@ rio_srcio_class(struct rio_srcio *srcio, struct rio_flow *flow, u_int *lenp)
 
 /* Try selecting the least-busy affine worker. */
 static inline struct rio_worker *
-rio_srcio_select_worker(struct rio_srcio *srcio, struct rio_selector *sel,
-    struct rio_worker *workers, u_int len, int x)
+rio_srcio_select_worker(struct rio_srcio *srcio, struct rio_scheduler *sched,
+    struct rio_worker *workers, u_int len)
 {
 	struct rio_worker *worker;
+	struct rio_selector *sel = &sched->rs_sel;
 
 	rio_selector_reset(sel);
 	for (u_int i = 0; i < len; i++) {
 		rio_selector_insert(sel, srcio, workers + i);
 	}
-	if ((worker = rio_selector_ideal(sel, workers, x)) != NULL) {
+	if ((worker = rio_scheduler_ideal(sched, workers)) != NULL) {
 		return (worker);
 	}
-	if ((worker = rio_selector_empty(sel, workers, x)) != NULL) {
+	if ((worker = rio_scheduler_empty(sched, workers)) != NULL) {
 		return (worker);
 	}
-	if ((worker = rio_selector_affine(sel, workers, x)) != NULL) {
+	if ((worker = rio_scheduler_affine(sched, workers)) != NULL) {
 		return (worker);
 	}
-	if ((worker = rio_selector_depth(sel, workers, x)) != NULL) {
-		return (worker);
-	}
-	/* TODO: remote worker selection */
-	return (NULL);
+	return (rio_scheduler_depth(sched, workers));
 }
 
-static inline int
-rio_srcio_schedule(struct rio_srcio *srcio, struct rio_selector *sel, int seq)
+/*
+ * Errors in the issue stage still have to be scheduled to a worker because
+ * completion requires switching vmspace to match the user process (for umtx).
+ */
+static inline void
+rio_srcio_schedule_error(struct rio_srcio *srcio, struct rio_scheduler *sched,
+    int error)
+{
+	struct rio_flow *flow;
+	struct rio_worker *worker;
+
+	srcio->rs_io->rio_cb.rio_error = error;
+	srcio->rs_io->rio_cb.rio_status = -1;
+	/* Try local flow first. */
+	flow = DPCPU_PTR(rio_flow);
+	/* Reuse the sync workers for issuer errors. */
+	worker = rio_srcio_select_worker(srcio, sched, flow->rf_sync,
+	    rio_flow_sync_workers);
+	rio_worker_enqueue(worker, srcio);
+}
+
+static inline void
+rio_srcio_schedule(struct rio_srcio *srcio, struct rio_scheduler *sched)
 {
 	struct rio_flow *flow;
 	struct rio_worker *workers, *worker;
@@ -1078,58 +1133,36 @@ rio_srcio_schedule(struct rio_srcio *srcio, struct rio_selector *sel, int seq)
 	/* Try local flow first. */
 	flow = DPCPU_PTR(rio_flow);
 	workers = rio_srcio_class(srcio, flow, &len);
-	if ((worker = rio_srcio_select_worker(srcio, sel, workers, len, seq))
-	    == NULL) {
-		/* TODO: remote worker selection */
-		return (ENOBUFS);
-	}
+	worker = rio_srcio_select_worker(srcio, sched, workers, len);
 	rio_worker_enqueue(worker, srcio);
-	return (0);
 }
 
 /* TODO: tunable, tuning */
 static u_int rio_attention_span = 1024; /* IO batching parameter */
 
-#define UIMAX(...) ({ \
-	u_int _vals[] = {__VA_ARGS__}; \
-	u_int _max = 0; \
-	for (u_int _i = 0; _i < nitems(_vals); _i++) { \
-		if (_vals[_i] > _max) { \
-		    _max = _vals[_i]; \
-		} \
-	} \
-	_max; \
-})
-
 static void
 rio_issuer_thread(void *arg)
 {
+	struct rio_scheduler sched;
 	struct rio_issuer *self = arg;
-	struct rio_selector sel;
 	struct thread *td = curthread;
 
 	thread_lock(td);
 	sched_bind(td, self->ri_cpu);
 	thread_unlock(td);
-	rio_selector_init(&sel, UIMAX(rio_flow_read_workers,
-	    rio_flow_write_workers, rio_flow_sync_workers));
-	/* TODO: more worker classes */
+	rio_scheduler_init(&sched, self);
 
 	for (;;) {
 		struct rio_src *src;
 		struct rio_softc *sc;
 		struct thread *td;
 		size_t issued;
-		int error;
 next:
-		/* TODO: Removal prevents concurrency!  Add an issuing list? */
+		/* TODO: Removal reduces concurrency!  Add an issuing list? */
 		/* TODO: Work stealing! */
-		error = rio_issuer_dequeue(self, &src);
-		if (__predict_false(error == ESHUTDOWN)) {
+		if (__predict_false(rio_issuer_dequeue(self, &src) != 0)) {
 			break;
 		}
-		/* TODO: handle ETIMEDOUT */
-		MPASS(error == 0);
 		sc = src->rs_sc;
 		if (__predict_false(rio_doomed(sc))) {
 			uma_zfree(rio_src_zone, src);
@@ -1184,7 +1217,7 @@ next:
 				break;
 			}
 			if (__predict_false(error != 0)) {
-				rio_srcio_error(srcio, error);
+				rio_srcio_schedule_error(srcio, &sched, error);
 				break;
 			}
 			/* XXX: Shouldn't this use a zone allocator? */
@@ -1192,17 +1225,14 @@ next:
 			    __predict_false((error = copyiniov(
 			    io->rio_cb.rio_iov, io->rio_cb.rio_length,
 			    &io->rio_cb.rio_iov, EMSGSIZE)) != 0)) {
-				rio_srcio_error(srcio, error);
+				rio_srcio_schedule_error(srcio, &sched, error);
 				break;
 			}
-			if ((error = rio_srcio_schedule(srcio, &sel,
-			    self->ri_seq)) != 0) {
-				rio_srcio_error(srcio, error);
-			}
+			rio_srcio_schedule(srcio, &sched);
 		}
 		rio_issuer_enqueue(self, src);
 	}
-	rio_selector_free(&sel);
+	rio_scheduler_destroy(&sched);
 	mtx_lock(&self->ri_lock);
 	self->ri_threads--;
 	if (self->ri_threads == 0) {
@@ -1246,7 +1276,10 @@ rio_worker_proc(void *arg)
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
-		self->rw_handler(srcio);
+		/* Handle if not already failed by issuer. */
+		if (__predict_true(srcio->rs_io->rio_cb.rio_status != -1)) {
+			self->rw_handler(srcio);
+		}
 		rio_srcio_complete(srcio);
 		/* TODO: Switch back to myvm when user process exits? */
 	}
