@@ -40,6 +40,7 @@ struct rio_config {
 #define	RIO_MLOCK	0x20
 #define RIO_FOFFSET	0x40
 /* TODO: extend beyond lio */
+#define RIO_CMD_FLAGS	(RIO_VECTORED | RIO_FOFFSET)
 
 /* TODO: flags? spare fields? sequence/generation number? sigevent? */
 struct riocb {

@@ -9,6 +9,7 @@
 #define EXTERR_CATEGORY EXTERR_CAT_RIO
 #include <sys/param.h>
 #include <sys/bitstring.h>
+#include <sys/buf.h>
 #include <sys/condvar.h>
 #include <sys/counter.h>
 #include <sys/fcntl.h>
@@ -26,6 +27,7 @@
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/stat.h>
+#include <sys/syscallsubr.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
@@ -33,6 +35,7 @@
 #include <sys/uio.h>
 #include <sys/umtxvar.h>
 #include <sys/user.h>
+#include <sys/vnode.h>
 
 #include <vm/uma.h>
 #include <vm/vm_param.h>
@@ -41,6 +44,7 @@
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
+#include <vm/vnode_pager.h>
 
 #include <ck_ec.h>
 #include <ck_ring.h>
@@ -186,6 +190,20 @@ struct rio_io {
 	struct riocb	rio_cb;		/* validated and stable copy */
 	struct file	*rio_fd_file;	/* ref'd file descriptor */
 };
+
+/* Get the basic command, stripped of flags. */
+static inline u_int
+rio_io_cmd(struct rio_io *io)
+{
+	return (io->rio_cb.rio_cmd & ~RIO_CMD_FLAGS);
+}
+
+/* Get the flag bits of the control block command. */
+static inline u_int
+rio_io_flags(struct rio_io *io)
+{
+	return (io->rio_cb.rio_cmd & RIO_CMD_FLAGS);
+}
 
 struct rio_softc {
 	struct rio	*sc_rio;	/* mapped address of SHM object */
@@ -475,7 +493,7 @@ STAILQ_HEAD(rio_srcios, rio_srcio);
 
 static uma_zone_t rio_srcio_zone;
 
-typedef int rio_srcio_handler_f(struct rio_srcio *);
+typedef void rio_srcio_handler_f(struct rio_srcio *);
 
 static inline uint32_t
 rio_srcio_index(struct rio_srcio *srcio)
@@ -514,7 +532,7 @@ rio_srcio_complete(struct rio_srcio *srcio)
 	if (io->rio_fd_file != NULL) {
 		rio_srcio_fdrop(srcio);
 	}
-	if ((io->rio_cb.rio_cmd & RIO_VECTORED) != 0) {
+	if ((rio_io_flags(io) & RIO_VECTORED) != 0) {
 		free(io->rio_cb.rio_iov, M_IOV);
 	}
 	index = rio_srcio_index(srcio);
@@ -556,25 +574,178 @@ rio_srcio_proc(struct rio_srcio *srcio)
 	return (srcio->rs_sc->sc_proc);
 }
 
-static int
+static void
 rio_srcio_read(struct rio_srcio *srcio)
 {
-	/* TODO */
-	return (EIO);
+	struct proc *p = rio_srcio_proc(srcio);
+	struct thread *td = curthread;
+	struct ucred *saved_cred = td->td_ucred;
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = &io->rio_cb;
+	struct file *fp = io->rio_fd_file;
+	struct iovec iov;
+	struct uio uio;
+	ssize_t len;
+	u_int flags;
+
+	/* TODO: special handling for devices/sockets */
+	td->td_ucred = sc->sc_cred;
+	/* TODO: surely this can be factored out and centralized */
+	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
+	uio.uio_td = td;
+	uio.uio_segflg = UIO_USERSPACE;
+	uio.uio_rw = UIO_READ;
+	uio.uio_offset = kiocb->rio_offset;
+	flags = rio_io_flags(io);
+	if ((flags & RIO_VECTORED) == 0) {
+		iov.iov_base = kiocb->rio_buf;
+		iov.iov_len = kiocb->rio_length;
+		uio.uio_iov = &iov;
+		uio.uio_iovcnt = 1;
+	} else {
+		uio.uio_iov = kiocb->rio_iov;
+		uio.uio_iovcnt = kiocb->rio_length;
+	}
+	len = 0;
+	for (int i = 0; i < uio.uio_iovcnt; i++) {
+		len += uio.uio_iov[i].iov_len;
+	}
+	uio.uio_resid = len;
+	/* We're not AIO, but close enough. */
+	vmspace_switch_aio(p->p_vmspace);
+	switch ((kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred,
+	    (flags & RIO_FOFFSET) == 0 ? 0 : FOF_OFFSET, td))) {
+	case 0:
+	case ERESTART:
+	case EINTR:
+	case EWOULDBLOCK:
+		kiocb->rio_status = len - uio.uio_resid;
+		break;
+	default:
+		kiocb->rio_status = -1;
+		break;
+	}
+	td->td_ucred = saved_cred;
 }
 
-static int
+static void
 rio_srcio_write(struct rio_srcio *srcio)
 {
-	/* TODO */
-	return (EIO);
+	struct proc *p = rio_srcio_proc(srcio);
+	struct thread *td = curthread;
+	struct ucred *saved_cred = td->td_ucred;
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = &io->rio_cb;
+	struct file *fp = io->rio_fd_file;
+	struct iovec iov;
+	struct uio uio;
+	ssize_t len;
+	u_int flags;
+
+	/* TODO: special handling for devices/sockets */
+	td->td_ucred = sc->sc_cred;
+	/* TODO: surely this can be factored out and centralized */
+	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
+	uio.uio_td = td;
+	uio.uio_segflg = UIO_USERSPACE;
+	uio.uio_rw = UIO_WRITE;
+	uio.uio_offset = kiocb->rio_offset;
+	flags = rio_io_flags(io);
+	if ((flags & RIO_VECTORED) == 0) {
+		iov.iov_base = kiocb->rio_buf;
+		iov.iov_len = kiocb->rio_length;
+		uio.uio_iov = &iov;
+		uio.uio_iovcnt = 1;
+	} else {
+		uio.uio_iov = kiocb->rio_iov;
+		uio.uio_iovcnt = kiocb->rio_length;
+	}
+	len = 0;
+	for (int i = 0; i < uio.uio_iovcnt; i++) {
+		len += uio.uio_iov[i].iov_len;
+	}
+	uio.uio_resid = len;
+	if (fp->f_type == DTYPE_VNODE) {
+		bwillwrite();
+	}
+	/* We're not AIO, but close enough. */
+	vmspace_switch_aio(p->p_vmspace);
+	switch ((kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred,
+	    (flags & RIO_FOFFSET) == 0 ? 0 : FOF_OFFSET, td))) {
+	case EPIPE:
+		PROC_LOCK(p);
+		kern_psignal(p, SIGPIPE);
+		PROC_UNLOCK(p);
+		/* FALLTHROUGH */
+	case 0:
+	case ERESTART:
+	case EINTR:
+	case EWOULDBLOCK:
+		kiocb->rio_status = len - uio.uio_resid;
+		break;
+	default:
+		kiocb->rio_status = -1;
+		break;
+	}
+	td->td_ucred = saved_cred;
 }
 
-static int
+static void
 rio_srcio_sync(struct rio_srcio *srcio)
 {
-	/* TODO */
-	return (EIO);
+	struct proc *p = rio_srcio_proc(srcio);
+	struct thread *td = curthread;
+	struct ucred *saved_cred = td->td_ucred;
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = &io->rio_cb;
+	struct file *fp = io->rio_fd_file;
+	struct vnode *vp;
+	u_int cmd = rio_io_cmd(io);
+	int error = 0;
+
+	if (cmd == RIO_MLOCK) {
+		/* We're not AIO, but close enough. */
+		vmspace_switch_aio(p->p_vmspace);
+		/*
+		 * TODO: After the commands are fleshed out, see if it is
+		 * possible to make ident an int and use the rio_data/rio_buf
+		 * field for anything that is a pointer (like AIO).
+		 */
+		error = kern_mlock(p, sc->sc_cred, kiocb->rio_ident,
+		    kiocb->rio_length);
+	} else if ((vp = fp->f_vnode) != NULL) {
+		struct mount *mp;
+
+		while (error != ERELOOKUP) {
+			if ((error = vn_start_write(vp, &mp, V_WAIT | V_PCATCH))
+			    != 0) {
+				break;
+			}
+			vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+			vnode_pager_clean_async(vp);
+			switch (cmd) {
+			case RIO_SYNC:
+				error = VOP_FSYNC(vp, MNT_WAIT, td);
+				break;
+			case RIO_DSYNC:
+				error = VOP_FDATASYNC(vp, td);
+				break;
+			default:
+				__assert_unreachable();
+			}
+			VOP_UNLOCK(vp);
+			vn_finished_write(mp);
+		}
+	}
+	if ((kiocb->rio_error = error) == 0) {
+		kiocb->rio_status = 0;
+	} else {
+		kiocb->rio_status = -1;
+	}
+	td->td_ucred = saved_cred;
 }
 
 /*
@@ -858,13 +1029,11 @@ rio_src_scheduler_none(struct rio_softc *sc)
 static inline struct rio_worker *
 rio_srcio_class(struct rio_srcio *srcio, struct rio_flow *flow, u_int *lenp)
 {
-	switch (srcio->rs_io->rio_cb.rio_cmd) {
+	switch (rio_io_cmd(srcio->rs_io)) {
 	case RIO_READ:
-	case RIO_READV:
 		*lenp = rio_flow_read_workers;
 		return (flow->rf_read);
 	case RIO_WRITE:
-	case RIO_WRITEV:
 		*lenp = rio_flow_write_workers;
 		return (flow->rf_write);
 	case RIO_SYNC:
@@ -986,7 +1155,6 @@ next:
 			struct riocb *iocb;
 			uint32_t index;
 			int fd, error;
-			u_int cmd;
 
 			if ((iocb = rio_submissions_trydequeue(sc, &index))
 			    == NULL) {
@@ -997,18 +1165,16 @@ next:
 			srcio->rs_io = io = sc->sc_io + index;
 			memcpy(&io->rio_cb, iocb, sizeof(*iocb));
 			fd = io->rio_cb.rio_ident;
-			switch ((cmd = io->rio_cb.rio_cmd)) {
+			switch (rio_io_cmd(io)) {
 			case RIO_NOP:
 			case RIO_MLOCK:
 				error = 0;
 				break;
 			case RIO_WRITE:
-			case RIO_WRITEV:
 				error = fget_write(td, fd, &cap_pwrite_rights,
 				    &io->rio_fd_file);
 				break;
 			case RIO_READ:
-			case RIO_READV:
 				error = fget_read(td, fd, &cap_pread_rights,
 				    &io->rio_fd_file);
 				break;
@@ -1027,7 +1193,7 @@ next:
 				break;
 			}
 			/* XXX: Shouldn't this use a zone allocator? */
-			if ((cmd & RIO_VECTORED) != 0 &&
+			if ((rio_io_flags(io) & RIO_VECTORED) != 0 &&
 			    __predict_false((error = copyiniov(
 			    io->rio_cb.rio_iov, io->rio_cb.rio_length,
 			    &io->rio_cb.rio_iov, EMSGSIZE)) != 0)) {
@@ -1051,8 +1217,6 @@ next:
 	kthread_exit();
 }
 
-/* TODO: implement handlers */
-
 static void
 rio_worker_proc(void *arg)
 {
@@ -1066,19 +1230,13 @@ rio_worker_proc(void *arg)
 	myvm = vmspace_acquire_ref(curproc);
 	for (;;) {
 		struct rio_srcio *srcio;
-		struct rio_softc *sc;
-		struct rio_io *io;
-		struct riocb *iocb;
 
 		/* TODO: idle timeouts for scaling down? */
 		if (rio_worker_dequeue(self, &srcio) != 0) {
 			/* ESHUTDOWN */
 			break;
 		}
-		sc = srcio->rs_sc;
-		io = srcio->rs_io;
-		iocb = &io->rio_cb;
-		if (__predict_false(rio_doomed(sc))) {
+		if (__predict_false(rio_doomed(srcio->rs_sc))) {
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
@@ -1087,18 +1245,9 @@ rio_worker_proc(void *arg)
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
-		/* TODO: This may be optional depending on cmd? */
-		/* We're not AIO, but close enough. */
-		vmspace_switch_aio(sc->sc_proc->p_vmspace);
-		switch (iocb->rio_cmd) {
-			/* TODO: perform IO (the tricky bit);
-			 * see AIO for inspiration */
-		default:
-			rio_srcio_error(srcio, EIO);
-			continue;
-		}
+		self->rw_handler(srcio);
 		rio_srcio_complete(srcio);
-		/* TODO: Policy for switching back to myvm here? */
+		/* TODO: Policy for switching back to myvm? */
 	}
 	vmspace_switch_aio(myvm);
 	vmspace_free(myvm);
