@@ -37,13 +37,11 @@
 #include <sys/user.h>
 #include <sys/vnode.h>
 
-#include <vm/uma.h>
-#include <vm/vm_param.h>
 #include <vm/pmap.h>
+#include <vm/uma.h>
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
-#include <vm/vm_object.h>
 #include <vm/vnode_pager.h>
 
 #include <ck_ec.h>
@@ -212,7 +210,6 @@ struct rio_softc {
 	struct rio_io	*sc_io;		/* kernel-private IO control blocks */
 	struct ucred	*sc_cred;	/* user credentials */
 	struct proc	*sc_proc;	/* user process */
-	vm_object_t	sc_object;	/* for vm_object_destroy */
 	size_t		sc_size;	/* for vm_map_remove */
 	u_int		sc_ncb;		/* number of control blocks */
 	u_int		sc_policy_id;	/* scheduling policy */
@@ -303,18 +300,17 @@ rio_destroy_task(void *arg, int pending __unused)
 	vm_offset_t kva;
 	size_t size;
 
-	PRELE(sc->sc_proc); /* XXX: ideally this could happen sooner */
+	crfree(sc->sc_cred);
+	PRELE(sc->sc_proc);
 	/*
-	 * The object stays mapped in the kernel even if the shmfd is closed or
-	 * the user process exits.  Instead of keeping the file ref'd to call
-	 * shm_unmap(), unmap and deallocate the object directly once safe.
+	 * The object can stay mapped even if the shmfd is closed or the user
+	 * process exits.  Unmap the object directly instead of requiring the
+	 * file to remain open for a call to shm_unmap().
 	 */
 	kva = (vm_offset_t)sc->sc_rio;
 	/* We call shm_map() with an offset of 0, so kva is aligned. */
 	size = round_page(sc->sc_size);
 	vm_map_remove(kernel_map, kva, kva + size);
-	vm_object_deallocate(sc->sc_object);
-	crfree(sc->sc_cred);
 	counter_u64_free(sc->sc_inflight);
 	free(sc->sc_io, M_RIO);
 	free(sc, M_RIO);
@@ -380,7 +376,6 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	sc->sc_completions = rio_completion_slots(rio, conf);
 	sc->sc_io = mallocarray(conf->rio_ncb, sizeof(*sc->sc_io), M_RIO,
 	    M_WAITOK | M_ZERO);
-	sc->sc_object = shmfd->shm_object;
 	sc->sc_size = size;
 	sc->sc_ncb = conf->rio_ncb;
 	sc->sc_policy_id = conf->rio_policy_id;
