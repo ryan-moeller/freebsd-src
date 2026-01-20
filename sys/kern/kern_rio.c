@@ -308,8 +308,13 @@ rio_destroy(struct rio_softc *sc)
 {
 	atomic_store_rel_int(&sc->sc_doomed, true);
 	smp_rendezvous(NULL, NULL, NULL, NULL);
-	/* TODO: this probably isn't enough to drain everything */
-	ck_ec_inc(&sc->sc_rio->rio_completion.rr_dqc, &rio_ec_umtx_mode);
+	if (counter_u64_fetch(sc->sc_inflight) == 0) {
+		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
+	} else {
+		/* TODO: this probably isn't enough to drain everything */
+		ck_ec_inc(&sc->sc_rio->rio_completion.rr_dqc,
+		    &rio_ec_umtx_mode);
+	}
 	/* The final completion enqueues the destruction task when doomed. */
 }
 
