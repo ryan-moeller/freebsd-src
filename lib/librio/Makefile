@@ -1,3 +1,5 @@
+.include <src.opts.mk>
+
 LIB=	rio
 PACKAGE=lib${LIB}
 SHLIB_MAJOR= 0
@@ -16,5 +18,8 @@ SRCS+=	ck_ec.c
 
 # TODO: manpages
 #MLINKS=	rio.3 rio_create.3
+
+HAS_TESTS=
+SUBDIR.${MK_TESTS}+= tests
 
 .include <bsd.lib.mk>
