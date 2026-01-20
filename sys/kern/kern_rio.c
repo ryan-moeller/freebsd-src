@@ -26,7 +26,6 @@
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/stat.h>
-#include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
@@ -143,9 +142,11 @@ static const u_int rio_flow_sync_workers = 4;
 static struct taskqueue *rio_doom;
 
 /* Shutdown handling. */
-static struct sx rio_shutdown_lock;
-SX_SYSINIT_FLAGS(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
-    SX_DUPOK);
+static u_int rio_hold_count;
+static struct mtx rio_shutdown_lock;
+MTX_SYSINIT(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
+    MTX_DEF);
+static struct cv rio_shutdown_cond;
 static boolean_t rio_shutdown_pending;
 _Static_assert(sizeof(rio_shutdown_pending) == sizeof(int),
     "rio_shutdown_pending must be int-sized for atomic use");
@@ -154,6 +155,30 @@ static inline bool
 rio_shuttingdown(void)
 {
 	return (atomic_load_acq_int(&rio_shutdown_pending));
+}
+
+static inline int
+rio_tryhold(void)
+{
+	mtx_lock(&rio_shutdown_lock);
+	if (rio_shuttingdown()) {
+		mtx_unlock(&rio_shutdown_lock);
+		return (ESHUTDOWN);
+	}
+	rio_hold_count++;
+	mtx_unlock(&rio_shutdown_lock);
+	return (0);
+}
+
+static inline void
+rio_drop(void)
+{
+	mtx_lock(&rio_shutdown_lock);
+	rio_hold_count--;
+	if (rio_hold_count == 0 && rio_shuttingdown()) {
+		cv_signal(&rio_shutdown_cond);
+	}
+	mtx_unlock(&rio_shutdown_lock);
 }
 
 /* kernel-private IO control block */
@@ -275,7 +300,7 @@ rio_destroy_task(void *arg, int pending __unused)
 	counter_u64_free(sc->sc_inflight);
 	free(sc->sc_io, M_RIO);
 	free(sc, M_RIO);
-	sx_sunlock(&rio_shutdown_lock);
+	rio_drop();
 }
 
 void
@@ -311,15 +336,15 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	if (conf->rio_policy_id >= nitems(rio_src_policies)) {
 		return (EINVAL);
 	}
-	if (sx_try_slock(&rio_shutdown_lock) == 0 || rio_shuttingdown()) {
-		return (ESHUTDOWN);
+	if ((error = rio_tryhold()) != 0) {
+		return (error);
 	}
 	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
 	size = rio_config_size(conf);
 	/* TODO: Will mmap enforce size limits for us? */
 	if ((error = shm_map(fp, size, 0, (void **)&sc->sc_rio)) != 0) {
+		rio_drop();
 		free(sc, M_RIO);
-		sx_sunlock(&rio_shutdown_lock);
 		return (error);
 	}
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
@@ -396,6 +421,7 @@ struct rio_issuer {
 	u_int			ri_len;
 	int			ri_seq;	/* for reducing bias */
 	u_int			ri_cpu;
+	u_int			ri_threads;
 };
 
 static inline void
@@ -595,6 +621,7 @@ struct rio_worker {
 	struct proc		*rw_hint;	/* last enqueued proc */
 	u_int			rw_len;
 	u_int			rw_cpu;
+	bool			rw_done;
 };
 
 static inline void
@@ -1007,6 +1034,12 @@ next:
 		rio_issuer_enqueue(self, src);
 	}
 	rio_selector_free(&sel);
+	mtx_lock(&self->ri_lock);
+	self->ri_threads--;
+	if (self->ri_threads == 0) {
+		cv_broadcast(&self->ri_cond);
+	}
+	mtx_unlock(&self->ri_lock);
 	kthread_exit();
 }
 
@@ -1058,6 +1091,10 @@ rio_worker_proc(void *arg)
 	}
 	vmspace_switch_aio(myvm);
 	vmspace_free(myvm);
+	mtx_lock(&self->rw_lock);
+	self->rw_done = true;
+	cv_broadcast(&self->rw_cond);
+	mtx_unlock(&self->rw_lock);
 	kproc_exit(0);
 }
 
@@ -1067,6 +1104,7 @@ rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
 	int error;
 
 	issuer->ri_cpu = cpu;
+	issuer->ri_threads = 0;
 	mtx_init(&issuer->ri_lock, "rio issuer lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&issuer->ri_cond, "rio issuer cond");
 	STAILQ_INIT(&issuer->ri_srcs);
@@ -1078,6 +1116,7 @@ rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
 			/* TODO: error handling */
 			return (error);
 		}
+		issuer->ri_threads++;
 	}
 	return (0);
 }
@@ -1142,7 +1181,9 @@ rio_load(void)
 
 	rio_src_zone = rio_zcreate("rio src", sizeof(struct rio_src));
 	rio_srcio_zone = rio_zcreate("rio src+io", sizeof(struct rio_srcio));
-	/* TODO: register process_* event handlers */
+
+	cv_init(&rio_shutdown_cond, "rio shutdown cond");
+
 	CPU_FOREACH(cpu) {
 		struct rio_flow *flow;
 
@@ -1171,7 +1212,20 @@ rio_load(void)
 static inline void
 rio_issuer_destroy(struct rio_issuer *issuer)
 {
-	/* TODO: drain queue */
+	struct rio_src *src1, *src2;
+
+	mtx_lock(&issuer->ri_lock);
+	cv_broadcast(&issuer->ri_cond);
+	while (issuer->ri_threads > 0) {
+		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
+	}
+	src1 = STAILQ_FIRST(&issuer->ri_srcs);
+	while (src1 != NULL) {
+		src2 = STAILQ_NEXT(src1, rs_srcs);
+		uma_zfree(rio_src_zone, src1);
+		src1 = src2;
+	}
+	mtx_unlock(&issuer->ri_lock);
 	mtx_destroy(&issuer->ri_lock);
 	cv_destroy(&issuer->ri_cond);
 }
@@ -1179,7 +1233,20 @@ rio_issuer_destroy(struct rio_issuer *issuer)
 static inline void
 rio_worker_destroy(struct rio_worker *worker)
 {
-	/* TODO: drain queue */
+	struct rio_srcio *srcio1, *srcio2;
+
+	mtx_lock(&worker->rw_lock);
+	cv_signal(&worker->rw_cond);
+	while (!worker->rw_done) {
+		cv_wait(&worker->rw_cond, &worker->rw_lock);
+	}
+	srcio1 = STAILQ_FIRST(&worker->rw_srcios);
+	while (srcio1 != NULL) {
+		srcio2 = STAILQ_NEXT(srcio1, rs_srcios);
+		uma_zfree(rio_srcio_zone, srcio1);
+		srcio1 = srcio2;
+	}
+	mtx_unlock(&worker->rw_lock);
 	mtx_destroy(&worker->rw_lock);
 	cv_destroy(&worker->rw_cond);
 }
@@ -1201,9 +1268,12 @@ rio_shutdown(void)
 {
 	u_int cpu;
 
-	sx_xlock(&rio_shutdown_lock);
+	mtx_lock(&rio_shutdown_lock);
 	atomic_store_rel_int(&rio_shutdown_pending, true);
-	sx_xunlock(&rio_shutdown_lock);
+	while (rio_hold_count > 0) {
+		cv_wait(&rio_shutdown_cond, &rio_shutdown_lock);
+	}
+	mtx_unlock(&rio_shutdown_lock);
 	CPU_FOREACH(cpu) {
 		struct rio_flow *flow;
 
@@ -1214,11 +1284,11 @@ rio_shutdown(void)
 		rio_workerclass_destroy(flow, sync);
 		/* TODO: more worker classes */
 	}
-	/* TODO: drain taskqueue */
+	taskqueue_quiesce(rio_doom);
 	taskqueue_free(rio_doom);
-	/* TODO: destroy everything else (event handlers?) */
 	uma_zdestroy(rio_src_zone);
 	uma_zdestroy(rio_srcio_zone);
+	cv_destroy(&rio_shutdown_cond);
 	return (0);
 }
 
