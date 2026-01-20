@@ -1148,7 +1148,7 @@ rio_workerclass_init_(struct rio_worker **workers, rio_srcio_handler_f *handler,
 {
 	int error;
 
-	*workers = mallocarray(n, sizeof(*workers), M_RIO, M_WAITOK | M_ZERO);
+	*workers = mallocarray(n, sizeof(**workers), M_RIO, M_WAITOK | M_ZERO);
 	for (u_int i = 0; i < n; i++) {
 		if ((error = rio_worker_init(*workers + i, handler, classname,
 		    cpu, i)) != 0) {
