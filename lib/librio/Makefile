@@ -1,4 +1,5 @@
 LIB=	rio
+PACKAGE=lib${LIB}
 SHLIB_MAJOR= 0
 
 SRCS=	rio.c

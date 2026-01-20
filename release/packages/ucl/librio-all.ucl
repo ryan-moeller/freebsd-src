@@ -1,0 +1,16 @@
+/*
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2026 Ryan Moeller
+ */
+
+comment = "SHM ring I/O library"
+
+desc = <<EOD
+librio implements the application side of the SHM-based ring-buffer I/O path
+(RIO).
+EOD
+
+annotations {
+	set = "optional,optional-jail"
+}
