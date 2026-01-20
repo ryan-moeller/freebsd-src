@@ -209,6 +209,7 @@ _LIBRARIES=	\
 		pthread \
 		radius \
 		regex \
+		rio \
 		roken \
 		rpcsec_gss \
 		rpcsvc \
