@@ -1112,7 +1112,7 @@ rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
 	for (u_int i = 0; i < rio_flow_issuer_threads; i++) {
 		/* Spawn issuer threads in the proc0 kernel process. */
 		if ((error = kthread_add(rio_issuer_thread, issuer, NULL, NULL,
-		    0, 0, "rio issuer %u.%u", cpu, i)) != 0) {
+		    0, 0, "rio issue %u.%u", cpu, i)) != 0) {
 			/* TODO: error handling */
 			return (error);
 		}
@@ -1129,12 +1129,13 @@ rio_worker_init(struct rio_worker *worker, rio_srcio_handler_f *handler,
 
 	worker->rw_handler = handler;
 	worker->rw_cpu = cpu;
+	worker->rw_done = false;
 	mtx_init(&worker->rw_lock, "rio worker lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&worker->rw_cond, "rio worker cond");
 	STAILQ_INIT(&worker->rw_srcios);
 	/* Spawn each worker as its own kernel process. */
 	if ((error = kproc_create(rio_worker_proc, worker, NULL, 0, 0,
-	    "rio %s worker %u.%u", classname, cpu, i)) != 0) {
+	    "rio %s %u.%u", classname, cpu, i)) != 0) {
 		/* TODO: error handling */
 		return (error);
 	}
