@@ -942,8 +942,11 @@ rio_issuer_thread(void *arg)
 {
 	struct rio_issuer *self = arg;
 	struct rio_selector sel;
+	struct thread *td = curthread;
 
-	sched_bind(curthread, self->ri_cpu);
+	thread_lock(td);
+	sched_bind(td, self->ri_cpu);
+	thread_unlock(td);
 	rio_selector_init(&sel, UIMAX(rio_flow_read_workers,
 	    rio_flow_write_workers, rio_flow_sync_workers));
 	/* TODO: more worker classes */
@@ -1055,8 +1058,11 @@ rio_worker_proc(void *arg)
 {
 	struct rio_worker *self = arg;
 	struct vmspace *myvm;
+	struct thread *td = curthread;
 
-	sched_bind(curthread, self->rw_cpu);
+	thread_lock(td);
+	sched_bind(td, self->rw_cpu);
+	thread_unlock(td);
 	myvm = vmspace_acquire_ref(curproc);
 	for (;;) {
 		struct rio_srcio *srcio;
