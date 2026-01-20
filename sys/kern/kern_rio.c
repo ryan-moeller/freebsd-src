@@ -73,6 +73,7 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 	if ((error = umtx_key_get(address, TYPE_SIMPLE_WAIT, AUTO_SHARE,
 	    &uq->uq_key)) != 0) {
 		/* TODO: handle error somehow */
+		printf("%s: umtx_key_get: %d\n", __func__, error);
 		return;
 	}
 	if (deadline == NULL) {
@@ -101,6 +102,7 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 		break;
 	default:
 		/* TODO: handle error somehow */
+		printf("%s: error %d\n", __func__, error);
 		break;
 	}
 }
@@ -108,8 +110,13 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 static void
 rio_ec_umtx_wake(const struct ck_ec_ops *ops __unused, const uint32_t *address)
 {
-	/* TODO: error handling? is curthread correct? */
-	kern_umtx_wake(curthread, __DECONST(uint32_t *, address), INT_MAX, 0);
+	int error;
+
+	if ((error = kern_umtx_wake(curthread, __DECONST(uint32_t *, address),
+	    INT_MAX, 0)) != 0) {
+		/* TODO: handle error somehow */
+		printf("%s: kern_umtx_wait: %d\n", __func__, error);
+	}
 }
 
 static const struct ck_ec_ops rio_ec_umtx_ops = {
@@ -243,6 +250,7 @@ rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
 			return (&rio->rio_control[index]);
 		}
 		/* TODO: how to handle invalid index? */
+		printf("%s: invalid index %u\n", __func__, index);
 	}
 	return (NULL);
 }
@@ -1269,6 +1277,7 @@ rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
 		if ((error = kthread_add(rio_issuer_thread, issuer, NULL, NULL,
 		    0, 0, "rio/issue%u.%u", cpu, i)) != 0) {
 			/* TODO: error handling */
+			printf("%s: kthread_add: %d\n", __func__, error);
 			return (error);
 		}
 		issuer->ri_threads++;
@@ -1292,6 +1301,7 @@ rio_worker_init(struct rio_worker *worker, rio_srcio_handler_f *handler,
 	if ((error = kproc_create(rio_worker_proc, worker, NULL, 0, 0,
 	    "rio/%s%u.%u", classname, cpu, i)) != 0) {
 		/* TODO: error handling */
+		printf("%s: kproc_create: %d\n", __func__, error);
 		return (error);
 	}
 	return (0);
