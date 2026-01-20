@@ -580,7 +580,6 @@ rio_srcio_proc(struct rio_srcio *srcio)
 static void
 rio_srcio_read(struct rio_srcio *srcio)
 {
-	struct proc *p = rio_srcio_proc(srcio);
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
@@ -594,7 +593,7 @@ rio_srcio_read(struct rio_srcio *srcio)
 
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: surely this can be factored out and centralized */
+	/* TODO: surely this can be factored out */
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
 	uio.uio_td = td;
 	uio.uio_segflg = UIO_USERSPACE;
@@ -615,8 +614,6 @@ rio_srcio_read(struct rio_srcio *srcio)
 		len += uio.uio_iov[i].iov_len;
 	}
 	uio.uio_resid = len;
-	/* We're not AIO, but close enough. */
-	vmspace_switch_aio(p->p_vmspace);
 	switch ((kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred,
 	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
 	case 0:
@@ -649,7 +646,7 @@ rio_srcio_write(struct rio_srcio *srcio)
 
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: surely this can be factored out and centralized */
+	/* TODO: surely this can be factored out */
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
 	uio.uio_td = td;
 	uio.uio_segflg = UIO_USERSPACE;
@@ -673,8 +670,6 @@ rio_srcio_write(struct rio_srcio *srcio)
 	if (fp->f_type == DTYPE_VNODE) {
 		bwillwrite();
 	}
-	/* We're not AIO, but close enough. */
-	vmspace_switch_aio(p->p_vmspace);
 	switch ((kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred,
 	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
 	case EPIPE:
@@ -698,7 +693,6 @@ rio_srcio_write(struct rio_srcio *srcio)
 static void
 rio_srcio_sync(struct rio_srcio *srcio)
 {
-	struct proc *p = rio_srcio_proc(srcio);
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
@@ -710,15 +704,13 @@ rio_srcio_sync(struct rio_srcio *srcio)
 	int error = 0;
 
 	if (cmd == RIO_MLOCK) {
-		/* We're not AIO, but close enough. */
-		vmspace_switch_aio(p->p_vmspace);
 		/*
 		 * TODO: After the commands are fleshed out, see if it is
 		 * possible to make ident an int and use the rio_data/rio_buf
 		 * field for anything that is a pointer (like AIO).
 		 */
-		error = kern_mlock(p, sc->sc_cred, kiocb->rio_ident,
-		    kiocb->rio_length);
+		error = kern_mlock(rio_srcio_proc(srcio), sc->sc_cred,
+		    kiocb->rio_ident, kiocb->rio_length);
 	} else if ((vp = fp->f_vnode) != NULL) {
 		struct mount *mp;
 
@@ -1239,6 +1231,12 @@ rio_worker_proc(void *arg)
 			/* ESHUTDOWN */
 			break;
 		}
+		/*
+		 * Every completion requires us to adopt the vmspace of the
+		 * user process.  We're not AIO, but close enough.
+		 */
+		vmspace_switch_aio(rio_srcio_proc(srcio)->p_vmspace);
+		/* Check for close. */
 		if (__predict_false(rio_doomed(srcio->rs_sc))) {
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
@@ -1250,7 +1248,7 @@ rio_worker_proc(void *arg)
 		}
 		self->rw_handler(srcio);
 		rio_srcio_complete(srcio);
-		/* TODO: Policy for switching back to myvm? */
+		/* TODO: Switch back to myvm when user process exits? */
 	}
 	vmspace_switch_aio(myvm);
 	vmspace_free(myvm);
