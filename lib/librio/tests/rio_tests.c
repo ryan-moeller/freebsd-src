@@ -38,6 +38,7 @@ ATF_TC_BODY(polling, tc)
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT, 0444)) != -1);
 	ATF_CHECK(rio_write(rio, fd, "test", 4, NULL) == 0);
+	ATF_CHECK(rio_submit(rio) == 0);
 	ATF_CHECK((iocb = rio_poll(rio, NULL)) != NULL);
 	ATF_CHECK_INTEQ(iocb->rio_cmd, RIO_WRITE);
 	ATF_CHECK_INTEQ(iocb->rio_ident, fd);
@@ -45,6 +46,7 @@ ATF_TC_BODY(polling, tc)
 	ATF_CHECK_INTEQ(iocb->rio_error, 0);
 	rio_return(rio, iocb);
 	ATF_CHECK(rio_read(rio, fd, buf, 4, NULL) == 0);
+	ATF_CHECK(rio_submit(rio) == 0);
 	ATF_CHECK((iocb = rio_poll(rio, NULL)) != NULL);
 	ATF_CHECK_INTEQ(iocb->rio_cmd, RIO_READ);
 	ATF_CHECK_INTEQ(iocb->rio_ident, fd);
