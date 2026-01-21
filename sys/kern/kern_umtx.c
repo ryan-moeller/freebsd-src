@@ -860,9 +860,9 @@ umtxq_sleep(struct umtx_q *uq, const char *wmesg,
  * Convert userspace address into unique logical address.
  */
 int
-umtx_key_get(const void *addr, int type, int share, struct umtx_key *key)
+umtx_key_get_proc(const void *addr, int type, int share, struct umtx_key *key,
+    struct proc *p)
 {
-	struct thread *td = curthread;
 	vm_map_t map;
 	vm_map_entry_t entry;
 	vm_pindex_t pindex;
@@ -872,11 +872,11 @@ umtx_key_get(const void *addr, int type, int share, struct umtx_key *key)
 	key->type = type;
 	if (share == THREAD_SHARE) {
 		key->shared = 0;
-		key->info.private.vs = td->td_proc->p_vmspace;
+		key->info.private.vs = p->p_vmspace;
 		key->info.private.addr = (uintptr_t)addr;
 	} else {
 		MPASS(share == PROCESS_SHARE || share == AUTO_SHARE);
-		map = &td->td_proc->p_vmspace->vm_map;
+		map = &p->p_vmspace->vm_map;
 		if (vm_map_lookup(&map, (vm_offset_t)addr, VM_PROT_WRITE,
 		    &entry, &key->info.shared.object, &pindex, &prot,
 		    &wired) != KERN_SUCCESS) {
@@ -892,7 +892,7 @@ umtx_key_get(const void *addr, int type, int share, struct umtx_key *key)
 			vm_object_reference(key->info.shared.object);
 		} else {
 			key->shared = 0;
-			key->info.private.vs = td->td_proc->p_vmspace;
+			key->info.private.vs = p->p_vmspace;
 			key->info.private.addr = (uintptr_t)addr;
 		}
 		vm_map_lookup_done(map, entry);
@@ -900,6 +900,12 @@ umtx_key_get(const void *addr, int type, int share, struct umtx_key *key)
 
 	umtxq_hash(key);
 	return (0);
+}
+
+int
+umtx_key_get(const void *addr, int type, int share, struct umtx_key *key)
+{
+	return (umtx_key_get_proc(addr, type, share, key, curproc));
 }
 
 /*
@@ -1333,19 +1339,25 @@ do_wait(struct thread *td, void *addr, u_long id,
  * Wake up threads sleeping on the specified address.
  */
 int
-kern_umtx_wake(struct thread *td, void *uaddr, int n_wake, int is_private)
+umtx_wake(struct proc *p, void *uaddr, int n_wake, int is_private)
 {
 	struct umtx_key key;
 	int ret;
 
-	if ((ret = umtx_key_get(uaddr, TYPE_SIMPLE_WAIT,
-	    is_private ? THREAD_SHARE : AUTO_SHARE, &key)) != 0)
+	if ((ret = umtx_key_get_proc(uaddr, TYPE_SIMPLE_WAIT,
+	    is_private ? THREAD_SHARE : AUTO_SHARE, &key, p)) != 0)
 		return (ret);
 	umtxq_lock(&key);
 	umtxq_signal(&key, n_wake);
 	umtxq_unlock(&key);
 	umtx_key_release(&key);
 	return (0);
+}
+
+int
+kern_umtx_wake(struct thread *td, void *uaddr, int n_wake, int is_private)
+{
+	return (umtx_wake(td->td_proc, uaddr, n_wake, is_private));
 }
 
 /*

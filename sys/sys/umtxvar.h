@@ -202,6 +202,7 @@ void umtx_abs_timeout_init(struct umtx_abs_timeout *, int, int,
     const struct timespec *);
 int umtx_copyin_timeout(const void *, struct timespec *);
 void umtx_exec(struct proc *p);
+int umtx_key_get_proc(const void *, int, int, struct umtx_key *, struct proc *);
 int umtx_key_get(const void *, int, int, struct umtx_key *);
 void umtx_key_release(struct umtx_key *);
 struct umtx_q *umtxq_alloc(void);
@@ -220,6 +221,7 @@ int umtxq_sleep_pi(struct umtx_q *, struct umtx_pi *, uint32_t,
     const char *, struct umtx_abs_timeout *, bool);
 void umtxq_unbusy(struct umtx_key *);
 void umtxq_unbusy_unlocked(struct umtx_key *);
+int umtx_wake(struct proc *p, void *, int, int);
 int kern_umtx_wake(struct thread *, void *, int, int);
 void umtx_pi_adjust(struct thread *, u_char);
 struct umtx_pi *umtx_pi_alloc(int);
