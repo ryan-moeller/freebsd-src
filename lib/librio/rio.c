@@ -42,15 +42,15 @@ wait32(const struct ck_ec_wait_state *state __unused, const uint32_t *address,
     uint32_t expected, const struct timespec *deadline)
 {
 	/* TODO: EINTR? */
-	_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAIT_UINT, expected,
-	    (void *)(uintptr_t)sizeof(*deadline),
+	_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAIT_UINT_PRIVATE,
+	    expected, (void *)(uintptr_t)sizeof(*deadline),
 	    __DECONST(struct timespec *, deadline));
 }
 
 static void
 wake32(const struct ck_ec_ops *op __unused, const uint32_t *address)
 {
-	_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAKE, INT_MAX, NULL,
+	_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAKE_PRIVATE, 1, NULL,
 	    NULL);
 }
 
