@@ -535,9 +535,6 @@ rio_srcio_complete(struct rio_srcio *srcio)
 	if (io->rio_fd_file != NULL) {
 		rio_srcio_fdrop(srcio);
 	}
-	if ((rio_io_flags(io) & RIO_VECTORED) != 0) {
-		free(io->rio_cb.rio_iov, M_IOV);
-	}
 	index = rio_srcio_index(srcio);
 	kiocb = &io->rio_cb;
 	iocb = &sc->sc_rio->rio_control[index];
@@ -1217,14 +1214,6 @@ next:
 				break;
 			}
 			if (__predict_false(error != 0)) {
-				rio_srcio_schedule_error(srcio, &sched, error);
-				break;
-			}
-			/* XXX: Shouldn't this use a zone allocator? */
-			if ((rio_io_flags(io) & RIO_VECTORED) != 0 &&
-			    __predict_false((error = copyiniov(
-			    io->rio_cb.rio_iov, io->rio_cb.rio_length,
-			    &io->rio_cb.rio_iov, EMSGSIZE)) != 0)) {
 				rio_srcio_schedule_error(srcio, &sched, error);
 				break;
 			}
