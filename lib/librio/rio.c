@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -117,12 +118,32 @@ rio_enqueue(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 	__unreachable();
 }
 
-/* Enqueue a submission or return it to the freelist on timeout. */
-static inline int
-rio_start(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
+/* Return a control block to the freelist. */
+static void
+rio_return(rio_t rio, struct riocb *iocb)
 {
-	if (rio_enqueue(rio, iocb, deadline) == -1) {
-		rio_return(rio, iocb);
+	struct rio_slot slot;
+
+	slot.rs_index = iocb - rio->rio_mapped->rio_control;
+	CK_RING_ENQUEUE_MPMC(rio, &rio->rio_freelist, rio->rio_freelist_slots,
+	    &slot);
+	ck_ec_inc(&rio->rio_freelist_nqc, &rio_ec_umtx_mode);
+}
+
+static inline int
+rio_start(rio_t rio, const struct riocb *iocb, u_int cmd,
+    const struct timespec *deadline)
+{
+	struct riocb *riocb;
+
+	if ((riocb = rio_reserve(rio, deadline)) == NULL) {
+		errno = ETIMEDOUT;
+		return (-1);
+	}
+	memcpy(riocb, iocb, sizeof(*iocb));
+	riocb->rio_cmd = cmd;
+	if (rio_enqueue(rio, riocb, deadline) == -1) {
+		rio_return(rio, riocb);
 		errno = ETIMEDOUT;
 		return (-1);
 	}
@@ -205,114 +226,46 @@ error_free:
 }
 
 int
-rio_read(rio_t rio, int fd, void *buf, size_t len,
+rio_read(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
+{
+	return (rio_start(rio, iocb, RIO_READ, deadline));
+}
+
+int
+rio_write(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
+{
+	return (rio_start(rio, iocb, RIO_WRITE, deadline));
+}
+
+int
+rio_readv(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
+{
+	return (rio_start(rio, iocb, RIO_READV, deadline));
+}
+
+int
+rio_writev(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
+{
+	return (rio_start(rio, iocb, RIO_WRITEV, deadline));
+}
+
+int
+rio_fsync(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
+{
+	return (rio_start(rio, iocb, RIO_SYNC, deadline));
+}
+
+int
+rio_fdatasync(rio_t rio, const struct riocb *iocb,
     const struct timespec *deadline)
 {
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_READ;
-	iocb->rio_ident = fd;
-	iocb->rio_buf = buf;
-	iocb->rio_length = len;
-	return (rio_start(rio, iocb, deadline));
+	return (rio_start(rio, iocb, RIO_DSYNC, deadline));
 }
 
 int
-rio_write(rio_t rio, int fd, const void *buf, size_t len,
-    const struct timespec *deadline)
+rio_mlock(rio_t rio, const struct riocb *iocb, const struct timespec *deadline)
 {
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_WRITE;
-	iocb->rio_ident = fd;
-	iocb->rio_buf = __DECONST(void *, buf);
-	iocb->rio_length = len;
-	return (rio_start(rio, iocb, deadline));
-}
-
-int
-rio_readv(rio_t rio, int fd, const struct iovec *iov, int niov,
-    const struct timespec *deadline)
-{
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_READV;
-	iocb->rio_ident = fd;
-	iocb->rio_iov = __DECONST(struct iovec *, iov);
-	iocb->rio_length = niov;
-	return (rio_start(rio, iocb, deadline));
-}
-
-int
-rio_writev(rio_t rio, int fd, const struct iovec *iov, int niov,
-    const struct timespec *deadline)
-{
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_WRITEV;
-	iocb->rio_ident = fd;
-	iocb->rio_iov = __DECONST(struct iovec *, iov);
-	iocb->rio_length = niov;
-	return (rio_start(rio, iocb, deadline));
-}
-
-int
-rio_fsync(rio_t rio, int fd, const struct timespec *deadline)
-{
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_SYNC;
-	iocb->rio_ident = fd;
-	return (rio_start(rio, iocb, deadline));
-}
-
-int
-rio_fdatasync(rio_t rio, int fd, const struct timespec *deadline)
-{
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_DSYNC;
-	iocb->rio_ident = fd;
-	return (rio_start(rio, iocb, deadline));
-}
-
-int
-rio_mlock(rio_t rio, void *addr, size_t len, const struct timespec *deadline)
-{
-	struct riocb *iocb;
-
-	if ((iocb = rio_reserve(rio, deadline)) == NULL) {
-		errno = ETIMEDOUT;
-		return (-1);
-	}
-	iocb->rio_cmd = RIO_MLOCK;
-	iocb->rio_ident = (uintptr_t)addr;
-	iocb->rio_length = len;
-	return (rio_start(rio, iocb, deadline));
+	return (rio_start(rio, iocb, RIO_MLOCK, deadline));
 }
 
 /* TODO: the rest of the ops */
@@ -325,11 +278,12 @@ rio_submit(rio_t rio)
 }
 
 /* Pull a completed control block off the completion queue. */
-struct riocb *
-rio_poll(rio_t rio, const struct timespec *deadline)
+int
+rio_poll(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 {
 	struct rio_slot slot;
 	struct rio *shm = rio->rio_mapped;
+	struct riocb *riocb;
 	uint32_t value;
 
 	for (;;) {
@@ -338,27 +292,18 @@ rio_poll(rio_t rio, const struct timespec *deadline)
 		    rio->rio_completion_slots, &slot)) {
 			ck_ec_inc(&shm->rio_completion.rr_dqc,
 			    &rio_ec_umtx_mode);
-			return (shm->rio_control + slot.rs_index);
+			riocb = shm->rio_control + slot.rs_index;
+			memcpy(iocb, riocb, sizeof(*iocb));
+			return (0);
 		}
 		/* TODO: predicate? */
 		if (ck_ec_wait(&shm->rio_completion.rr_nqc,
 		    &rio_ec_umtx_mode, value, deadline) == -1) {
-			return (NULL);
+			errno = ETIMEDOUT;
+			return (-1);
 		}
 	}
 	__unreachable();
-}
-
-/* Return a control block to the freelist. */
-void
-rio_return(rio_t rio, struct riocb *iocb)
-{
-	struct rio_slot slot;
-
-	slot.rs_index = iocb - rio->rio_mapped->rio_control;
-	CK_RING_ENQUEUE_MPMC(rio, &rio->rio_freelist, rio->rio_freelist_slots,
-	    &slot);
-	ck_ec_inc(&rio->rio_freelist_nqc, &rio_ec_umtx_mode);
 }
 
 /* Release handle resources. */
