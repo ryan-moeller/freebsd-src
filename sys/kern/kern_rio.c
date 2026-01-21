@@ -51,86 +51,6 @@
 
 static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 
-static int
-rio_ec_gettime(const struct ck_ec_ops *ops __unused, struct timespec *out)
-{
-	/* TODO: revisit which clock source to use, this is CLOCK_MONOTONIC */
-	nanouptime(out);
-	return (0);
-}
-
-static void
-rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
-    uint32_t expected, const struct timespec *deadline)
-{
-	struct umtx_abs_timeout uto, *utop;
-	struct umtx_q *uq;
-	uint32_t value;
-	int error;
-
-	/* This implementation is largely informed by kern_umtq.c:do_wait(). */
-	uq = curthread->td_umtxq;
-	if ((error = umtx_key_get(address, TYPE_SIMPLE_WAIT, AUTO_SHARE,
-	    &uq->uq_key)) != 0) {
-		/* TODO: handle error somehow */
-		printf("%s: umtx_key_get: %d\n", __func__, error);
-		return;
-	}
-	if (deadline == NULL) {
-		utop = NULL;
-	} else {
-		/* TODO: revisit which clock source to use */
-		umtx_abs_timeout_init(&uto, CLOCK_MONOTONIC, true, deadline);
-		utop = &uto;
-	}
-	umtxq_lock(&uq->uq_key);
-	umtxq_insert(uq);
-	umtxq_unlock(&uq->uq_key);
-	error = fueword32(address, &value);
-	umtxq_lock(&uq->uq_key);
-	if (error == 0 && value == expected) {
-		error = umtxq_sleep(uq, "riowait", utop);
-	}
-	if ((uq->uq_flags & UQF_UMTXQ) != 0) {
-		umtxq_remove(uq);
-	}
-	umtxq_unlock(&uq->uq_key);
-	umtx_key_release(&uq->uq_key);
-	switch (error) {
-	case 0:
-	case ETIMEDOUT:
-		break;
-	default:
-		/* TODO: handle error somehow */
-		printf("%s: error %d\n", __func__, error);
-		break;
-	}
-}
-
-static void
-rio_ec_umtx_wake(const struct ck_ec_ops *ops __unused, const uint32_t *address)
-{
-	int error;
-
-	if ((error = kern_umtx_wake(curthread, __DECONST(uint32_t *, address),
-	    INT_MAX, 0)) != 0) {
-		/* TODO: handle error somehow */
-		printf("%s: kern_umtx_wait: %d\n", __func__, error);
-	}
-}
-
-static const struct ck_ec_ops rio_ec_umtx_ops = {
-	.gettime = rio_ec_gettime,
-	.wait32 = rio_ec_umtx_wait,
-	.wake32 = rio_ec_umtx_wake,
-	/* TODO: tune/override default options for ABI stability */
-};
-
-static const struct ck_ec_mode rio_ec_umtx_mode = {
-	.ops = &rio_ec_umtx_ops,
-	.single_producer = false,
-};
-
 typedef int rio_src_scheduler_f(struct rio_softc *);
 
 /* TODO: come up with a set of useful scheduling policies */
@@ -211,12 +131,13 @@ rio_io_flags(struct rio_io *io)
 }
 
 struct rio_softc {
-	struct rio	*sc_rio;	/* mapped address of SHM object */
+	struct rio	*sc_rio;	/* kernel address of SHM object */
 	struct rio_slot *sc_submissions;/* submission queue slots in rio */
 	struct rio_slot *sc_completions;/* completion queue slots in rio */
 	struct rio_io	*sc_io;		/* kernel-private IO control blocks */
 	struct ucred	*sc_cred;	/* user credentials */
 	struct proc	*sc_proc;	/* user process */
+	vm_offset_t	sc_urio;	/* user address of SHM object */
 	size_t		sc_size;	/* for vm_map_remove */
 	u_int		sc_ncb;		/* number of control blocks */
 	u_int		sc_policy_id;	/* scheduling policy */
@@ -225,12 +146,103 @@ struct rio_softc {
 	boolean_t	sc_doomed;	/* impending doom */
 	counter_u64_t	sc_inflight;	/* #io issued and not yet completed */
 	/* TODO: flags? more counters? */
+	/*
+	 * XXX: As a workaround for not having context in wake32, we have to
+	 * embed the CK event counter ops and mode in every softc so the ops
+	 * can be used to derive a pointer to the softc.
+	 */
+	struct ck_ec_ops	sc_ec_umtx_ops;
+	struct ck_ec_mode	sc_ec_umtx_mode;
 };
 
 static inline bool
 rio_doomed(struct rio_softc *sc)
 {
 	return (atomic_load_acq_int(&sc->sc_doomed));
+}
+
+static int
+rio_ec_gettime(const struct ck_ec_ops *ops __unused, struct timespec *out)
+{
+	nanouptime(out); /* CLOCK_MONOTONIC */
+	return (0);
+}
+
+/* Translate a kernel address to a user address. */
+static inline void *
+rio_uaddr(struct rio_softc *sc, const uint32_t *address)
+{
+	vm_offset_t offset = (vm_offset_t)address - (vm_offset_t)sc->sc_rio;
+	vm_offset_t uaddr = sc->sc_urio + offset;
+
+	return ((void *)uaddr);
+}
+
+static void
+rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
+    uint32_t expected, const struct timespec *deadline)
+{
+	struct umtx_abs_timeout uto, *utop;
+	struct umtx_q *uq;
+	struct rio_softc *sc = state->data;
+	void *uaddr;
+	uint32_t value;
+	int error;
+
+	/* This implementation is largely informed by kern_umtq.c:do_wait(). */
+	uq = curthread->td_umtxq; /* TODO: Is this the right queue? */
+	uaddr = rio_uaddr(sc, address);
+	if ((error = umtx_key_get_proc(uaddr, TYPE_SIMPLE_WAIT, AUTO_SHARE,
+	    &uq->uq_key, sc->sc_proc)) != 0) {
+		/* TODO: handle error somehow */
+		printf("%s: umtx_key_get_proc: %d\n", __func__, error);
+		return;
+	}
+	if (deadline == NULL) {
+		utop = NULL;
+	} else {
+		umtx_abs_timeout_init(&uto, CLOCK_MONOTONIC, true, deadline);
+		utop = &uto;
+	}
+	umtxq_lock(&uq->uq_key);
+	umtxq_insert(uq);
+	umtxq_unlock(&uq->uq_key);
+	value = *address;
+	umtxq_lock(&uq->uq_key);
+	if (value == expected) {
+		error = umtxq_sleep(uq, "riowait", utop);
+	} else {
+		error = 0;
+	}
+	if ((uq->uq_flags & UQF_UMTXQ) != 0) {
+		umtxq_remove(uq);
+	}
+	umtxq_unlock(&uq->uq_key);
+	umtx_key_release(&uq->uq_key);
+	switch (error) {
+	case 0:
+	case ETIMEDOUT:
+		break;
+	default:
+		/* TODO: handle error somehow */
+		printf("%s: error %d\n", __func__, error);
+		break;
+	}
+}
+
+static void
+rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
+{
+	struct rio_softc *sc;
+	void *uaddr;
+	int error;
+
+	sc = __containerof(ops, struct rio_softc, sc_ec_umtx_ops);
+	uaddr = rio_uaddr(sc, address);
+	if ((error = umtx_wake(sc->sc_proc, uaddr, 1, true)) != 0) {
+		/* TODO: handle error somehow */
+		printf("%s: umtx_wake: error=%d\n", __func__, error);
+	}
 }
 
 static inline struct riocb *
@@ -244,7 +256,7 @@ rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
 	    sc->sc_submissions, &slot)) {
 		uint32_t index = slot.rs_index;
 
-		ck_ec_inc(&rio->rio_submission.rr_dqc, &rio_ec_umtx_mode);
+		ck_ec_inc(&rio->rio_submission.rr_dqc, &sc->sc_ec_umtx_mode);
 		if (__predict_true(index < sc->sc_ncb)) {
 			*indexp = index;
 			return (&rio->rio_control[index]);
@@ -270,7 +282,6 @@ rio_completions_enqueue_pred(const struct ck_ec_wait_state *state,
 	return (0);
 }
 
-/* TODO: generalization to batch several before touching event counter? */
 static inline int
 rio_completions_enqueue(struct rio_softc *sc, uint32_t index)
 {
@@ -287,13 +298,13 @@ rio_completions_enqueue(struct rio_softc *sc, uint32_t index)
 		if (CK_RING_ENQUEUE_MPMC(rio, &rio->rio_completion.rr_ring,
 		    sc->sc_completions, &slot)) {
 			ck_ec_inc(&rio->rio_completion.rr_nqc,
-			    &rio_ec_umtx_mode);
+			    &sc->sc_ec_umtx_mode);
 			return (0);
 		}
 		/* TODO: deadline from policy? that's a can of worms... */
 		error = ck_ec_wait_pred(&rio->rio_completion.rr_dqc,
-		    &rio_ec_umtx_mode, value, rio_completions_enqueue_pred, sc,
-		    NULL);
+		    &sc->sc_ec_umtx_mode, value, rio_completions_enqueue_pred,
+		    sc, NULL);
 		if (__predict_false(error != 0)) {
 			return (error);
 		}
@@ -333,11 +344,18 @@ rio_destroy(struct rio_softc *sc)
 	if (counter_u64_fetch(sc->sc_inflight) == 0) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	} else {
-		/* TODO: this probably isn't enough to drain everything */
-		ck_ec_inc(&sc->sc_rio->rio_completion.rr_dqc,
-		    &rio_ec_umtx_mode);
+		/*
+		 * Wake all workers waiting to enqueue for completion.  We don't
+		 * actually have to make space in the ring.  Any new attempts to
+		 * enqueue for completion with a full ring will fail the wait
+		 * predicate.
+		 */
+		while (ck_ec_has_waiters(&sc->sc_rio->rio_completion.rr_dqc)) {
+			ck_ec_inc(&sc->sc_rio->rio_completion.rr_dqc,
+			    &sc->sc_ec_umtx_mode);
+		}
+		/* The final completion enqueues the destruction task. */
 	}
-	/* The final completion enqueues the destruction task when doomed. */
 }
 
 static inline void
@@ -346,6 +364,25 @@ rio_ring_init(struct rio_ring *ring, u_int size)
 	ck_ring_init(&ring->rr_ring, size);
 	ck_ec_init(&ring->rr_nqc, 0);
 	ck_ec_init(&ring->rr_dqc, 0);
+}
+
+/* Get the user address of the shmfd object in process p. */
+static inline vm_offset_t
+rio_shm_uaddr(struct rio_softc *sc, struct shmfd *shmfd)
+{
+	vm_map_t map = &sc->sc_proc->p_vmspace->vm_map;
+	vm_map_entry_t entry;
+	vm_offset_t uaddr = 0;
+
+	vm_map_lock_read(map);
+	VM_MAP_ENTRY_FOREACH(entry, map) {
+		if (entry->object.vm_object == shmfd->shm_object) {
+			uaddr = entry->start;
+			break;
+		}
+	}
+	vm_map_unlock_read(map);
+	return (uaddr);
 }
 
 static int
@@ -384,11 +421,22 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	sc->sc_completions = rio_completion_slots(rio, conf);
 	sc->sc_io = mallocarray(conf->rio_ncb, sizeof(*sc->sc_io), M_RIO,
 	    M_WAITOK | M_ZERO);
+	sc->sc_urio = rio_shm_uaddr(sc, shmfd);
 	sc->sc_size = size;
 	sc->sc_ncb = conf->rio_ncb;
 	sc->sc_policy_id = conf->rio_policy_id;
 	TASK_INIT(&sc->sc_destroy_task, 0, rio_destroy_task, sc);
 	sc->sc_inflight = counter_u64_alloc(M_WAITOK);
+	sc->sc_ec_umtx_ops = (struct ck_ec_ops){
+		.gettime = rio_ec_gettime,
+		.wait32 = rio_ec_umtx_wait,
+		.wake32 = rio_ec_umtx_wake,
+		/* TODO: tune/override default options for ABI stability */
+	};
+	sc->sc_ec_umtx_mode = (struct ck_ec_mode){
+		.ops = &sc->sc_ec_umtx_ops,
+		.single_producer = false,
+	};
 	shmfd->shm_rio = sc;
 	return (0);
 }
