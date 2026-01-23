@@ -759,7 +759,7 @@ rio_srcio_sync(struct rio_srcio *srcio)
 	} else if ((vp = fp->f_vnode) != NULL) {
 		struct mount *mp;
 
-		while (error != ERELOOKUP) {
+		while (error == ERELOOKUP) {
 			if ((error = vn_start_write(vp, &mp, V_WAIT | V_PCATCH))
 			    != 0) {
 				break;
