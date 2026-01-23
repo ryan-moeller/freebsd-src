@@ -201,7 +201,7 @@ rio_create(rio_t *riop, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid)
 		goto error_munmap;
 	}
 	rio->rio_mapped = p;
-	ck_ring_init(&rio->rio_freelist, size);
+	ck_ring_init(&rio->rio_freelist, ncb);
 	ck_ec_init(&rio->rio_freelist_nqc, 0);
 	/* The freelist doesn't need the dequeue event counter. */
 	for (struct rio_slot slot = {0}; slot.rs_index < ncb; slot.rs_index++) {
@@ -294,6 +294,7 @@ rio_poll(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 			    &rio_ec_umtx_mode);
 			riocb = shm->rio_control + slot.rs_index;
 			memcpy(iocb, riocb, sizeof(*iocb));
+			rio_return(rio, riocb);
 			return (0);
 		}
 		/* TODO: predicate? */
