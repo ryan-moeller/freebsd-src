@@ -230,8 +230,9 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 	}
 }
 
-static void
-rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
+/* Wake any number of waiters. */
+static inline void
+rio_ec_umtx_wake_n(const struct ck_ec_ops *ops, const uint32_t *address, int n)
 {
 	struct rio_softc *sc;
 	void *uaddr;
@@ -239,10 +240,17 @@ rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
 
 	sc = __containerof(ops, struct rio_softc, sc_ec_umtx_ops);
 	uaddr = rio_uaddr(sc, address);
-	if ((error = umtx_wake(sc->sc_proc, uaddr, 1, true)) != 0) {
+	if ((error = umtx_wake(sc->sc_proc, uaddr, n, true)) != 0) {
 		/* TODO: handle error somehow */
 		printf("%s: umtx_wake: error=%d\n", __func__, error);
 	}
+}
+
+/* Wake a single waiter. */
+static void
+rio_ec_umtx_wake_1(const struct ck_ec_ops *ops, const uint32_t *address)
+{
+	rio_ec_umtx_wake_n(ops, address, 1);
 }
 
 static inline struct riocb *
@@ -351,10 +359,8 @@ rio_destroy(struct rio_softc *sc)
 		 * enqueue for completion with a full ring will fail the wait
 		 * predicate.
 		 */
-		while (ck_ec_has_waiters(&sc->sc_rio->rio_completion.rr_dqc)) {
-			ck_ec_inc(&sc->sc_rio->rio_completion.rr_dqc,
-			    &sc->sc_ec_umtx_mode);
-		}
+		rio_ec_umtx_wake_n(&sc->sc_ec_umtx_ops,
+		    &sc->sc_rio->rio_completion.rr_dqc.counter, UINT_MAX);
 		/* The final completion enqueues the destruction task. */
 	}
 }
@@ -431,7 +437,7 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	sc->sc_ec_umtx_ops = (struct ck_ec_ops){
 		.gettime = rio_ec_gettime,
 		.wait32 = rio_ec_umtx_wait,
-		.wake32 = rio_ec_umtx_wake,
+		.wake32 = rio_ec_umtx_wake_1,
 		/* TODO: tune/override default options for ABI stability */
 	};
 	sc->sc_ec_umtx_mode = (struct ck_ec_mode){
