@@ -293,7 +293,9 @@ rio_poll(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 			ck_ec_inc(&shm->rio_completion.rr_dqc,
 			    &rio_ec_umtx_mode);
 			riocb = shm->rio_control + slot.rs_index;
-			memcpy(iocb, riocb, sizeof(*iocb));
+			if (iocb != NULL) {
+				memcpy(iocb, riocb, sizeof(*iocb));
+			}
 			rio_return(rio, riocb);
 			return (0);
 		}
