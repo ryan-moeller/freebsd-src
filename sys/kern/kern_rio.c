@@ -916,14 +916,29 @@ rio_selector_init(struct rio_selector *sel, u_int len)
 static inline void
 rio_selector_reset(struct rio_selector *sel)
 {
-	u_int len = sel->rs_len;
+	u_int stop = sel->rs_len - 1;
 
-	bit_nclear(sel->rs_empty, 0, len);
-	bit_nclear(sel->rs_affine, 0, len);
-	bit_nclear(sel->rs_minimum, 0, len);
+	bit_nclear(sel->rs_empty, 0, stop);
+	bit_nclear(sel->rs_affine, 0, stop);
+	bit_nclear(sel->rs_minimum, 0, stop);
 	sel->rs_min = UINT_MAX;
 	sel->rs_n = 0;
 }
+
+#if 0
+static inline void
+dump_bits(bitstr_t *bits, size_t len)
+{
+	ssize_t count;
+	u_int i;
+
+	bit_count(bits, 0, len, &count);
+	printf("%s: len=%zu count=%zd\n", __func__, len, count);
+	bit_foreach(bits, len, i) {
+		printf("%s: bit %u set\n", __func__, i);
+	}
+}
+#endif
 
 static inline void
 rio_selector_insert(struct rio_selector *sel, struct rio_srcio *srcio,
@@ -931,19 +946,19 @@ rio_selector_insert(struct rio_selector *sel, struct rio_srcio *srcio,
 {
 	u_int idx = sel->rs_n++;
 	/* XXX: Unlocked, but it's probably good enough. */
-	u_int len = worker->rw_len;
+	u_int qlen = worker->rw_len;
 
-	if (len == 0) {
+	if (qlen == 0) {
 		bit_set(sel->rs_empty, idx);
 	}
 	if (worker->rw_hint == rio_srcio_proc(srcio)) {
 		bit_set(sel->rs_affine, idx);
 	}
-	if (len == sel->rs_min) {
+	if (qlen == sel->rs_min) {
 		bit_set(sel->rs_minimum, idx);
-	} else if (len < sel->rs_min) {
-		sel->rs_min = len;
-		bit_nclear(sel->rs_minimum, 0, sel->rs_len);
+	} else if (qlen < sel->rs_min) {
+		sel->rs_min = qlen;
+		bit_nclear(sel->rs_minimum, 0, idx);
 		bit_set(sel->rs_minimum, idx);
 	}
 }
@@ -972,7 +987,7 @@ rio_selector_destroy(struct rio_selector *sel)
 static inline void
 bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 {
-	size_t n = bitstr_size(len);
+	size_t n = bitstr_size(len) / sizeof(*a);
 
 	for (size_t i = 0; i < n; i++) {
 		r[i] = a[i] & b[i];
@@ -997,9 +1012,10 @@ static inline struct rio_worker *
 rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
 {
 	struct rio_selector *sel = &sched->rs_sel;
+	u_int stop = sel->rs_n - 1;
 	u_int count, idx;
 
-	bit_nclear(sel->rs_candidates, 0, sel->rs_n);
+	bit_nclear(sel->rs_candidates, 0, stop);
 	bit_and(sel->rs_empty, sel->rs_affine, sel->rs_candidates, sel->rs_n);
 	count = 0;
 	bit_foreach(sel->rs_candidates, sel->rs_n, idx) {
@@ -1031,19 +1047,20 @@ static inline struct rio_worker *
 rio_scheduler_affine(struct rio_scheduler *sched, struct rio_worker *workers)
 {
 	struct rio_selector *sel = &sched->rs_sel;
+	u_int stop = sel->rs_n - 1;
 	u_int min, count, idx;
 
-	bit_nclear(sel->rs_candidates, 0, sel->rs_n);
+	bit_nclear(sel->rs_candidates, 0, stop);
 	min = UINT_MAX;
 	bit_foreach(sel->rs_affine, sel->rs_n, idx) {
-		u_int len = workers[idx].rw_len;
+		u_int qlen = workers[idx].rw_len;
 
-		if (len > min) {
+		if (qlen > min) {
 			continue;
 		}
-		if (len < min) {
-			min = len;
-			bit_nclear(sel->rs_candidates, 0, sel->rs_n);
+		if (qlen < min) {
+			min = qlen;
+			bit_nclear(sel->rs_candidates, 0, stop);
 		}
 		bit_set(sel->rs_candidates, idx);
 	}
@@ -1068,9 +1085,7 @@ rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
 	bit_foreach(sel->rs_minimum, sel->rs_n, idx) {
 		sel->rs_indices[count++] = idx;
 	}
-	if (count == 0) {
-		return (NULL);
-	}
+	MPASS(count > 0);
 	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
 
