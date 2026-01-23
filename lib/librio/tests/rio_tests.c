@@ -6,6 +6,7 @@
 
 #include <sys/param.h>
 #include <sys/uio.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,7 +15,11 @@
 
 #include <atf-c.h>
 
-#define TESTCONFIG 32, 32, 32, 0
+#define SQLEN	32
+#define CQLEN	32
+#define NCB	64
+#define POLICY	0
+#define TESTCONFIG	SQLEN, CQLEN, NCB, POLICY
 
 ATF_TC(create_destroy);
 ATF_TC_HEAD(create_destroy, tc)
@@ -132,10 +137,59 @@ ATF_TC_BODY(vectors, tc)
 	rio_destroy(rio);
 }
 
+ATF_TC(errors);
+ATF_TC_HEAD(errors, tc)
+{
+	atf_tc_set_md_var(tc, "descr", "Tests error completion");
+}
+
+ATF_TC_BODY(errors, tc)
+{
+	const struct timespec deadline = {0};
+	struct riocb iocb = {0};
+	rio_t rio = NULL;
+
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
+
+	/* Try reading an invalid file into an invalid buffer. */
+	iocb.rio_ident = -1;
+	iocb.rio_buf = NULL;
+	iocb.rio_length = 0;
+	/* SQLEN - 1 because the ring always has an empty marker slot. */
+	for (int i = 0; i < SQLEN - 1; i++) {
+		/* Non-blocking submissions succeed with space available. */
+		ATF_CHECK(rio_read(rio, &iocb, &deadline) == 0);
+	}
+	/* Non-blocking submission fails ETIMEDOUT when out of space. */
+	ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
+	/* Now we must submit. */
+	ATF_CHECK(rio_submit(rio) == 0);
+	for (int i = 0; i < SQLEN - 1; i++) {
+		/* Blocking submissions succeed until full again. */
+		ATF_CHECK(rio_read(rio, &iocb, NULL) == 0);
+	}
+	ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
+	/* Submit the next batch. */
+	ATF_CHECK(rio_submit(rio) == 0);
+	/* Now the completion queue is full and worker queues are backing up. */
+	for (int i = 0; i < 2 * (SQLEN - 1); i++) {
+		/* Blocking dequeues succeed while completions are available. */
+		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+		ATF_CHECK_INTEQ(iocb.rio_ident, -1);
+		ATF_CHECK_INTEQ(iocb.rio_status, -1);
+		ATF_CHECK_INTEQ(iocb.rio_error, EBADF);
+	}
+	/* Non-blocking dequeue fails, nothing left. */
+	ATF_CHECK_ERRNO(ETIMEDOUT, rio_poll(rio, &iocb, &deadline));
+
+	rio_destroy(rio);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, create_destroy);
 	ATF_TP_ADD_TC(tp, polling);
 	ATF_TP_ADD_TC(tp, vectors);
+	ATF_TP_ADD_TC(tp, errors);
 	return (atf_no_error());
 }
