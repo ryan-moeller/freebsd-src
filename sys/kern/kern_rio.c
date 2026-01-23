@@ -306,6 +306,7 @@ rio_completions_enqueue(struct rio_softc *sc, uint32_t index)
 		    &sc->sc_ec_umtx_mode, value, rio_completions_enqueue_pred,
 		    sc, NULL);
 		if (__predict_false(error != 0)) {
+			MPASS(error == ECANCELED || error == ESHUTDOWN);
 			return (error);
 		}
 	}
