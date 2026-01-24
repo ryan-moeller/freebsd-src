@@ -202,7 +202,7 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 	int error;
 
 	/* This implementation is largely informed by kern_umtq.c:do_wait(). */
-	uq = curthread->td_umtxq; /* TODO: Is this the right queue? */
+	uq = curthread->td_umtxq;
 	uaddr = rio_uaddr(sc, address);
 	if ((error = umtx_key_get_proc(uaddr, TYPE_SIMPLE_WAIT, AUTO_SHARE,
 	    &uq->uq_key, sc->sc_proc)) != 0) {
@@ -654,7 +654,6 @@ rio_srcio_read(struct rio_srcio *srcio)
 
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: surely this can be factored out */
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
 	uio.uio_td = td;
 	uio.uio_segflg = UIO_USERSPACE;
@@ -707,7 +706,6 @@ rio_srcio_write(struct rio_srcio *srcio)
 
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: surely this can be factored out */
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
 	uio.uio_td = td;
 	uio.uio_segflg = UIO_USERSPACE;
@@ -811,39 +809,8 @@ rio_srcio_sync(struct rio_srcio *srcio)
  * vmspace to perform copies to or from the user process.
  *
  * If the workers pulled directly from the src ring then they couldn't be
- * specialized for specific IO types (read, write, socket, etc).  Instead, we
- * of separate issuers is that they can issue the requests to the appropriate
- * pool of workers.
- *
- * So we have an issuer that issues IO from sources to its set of workers.
- *
- * The workers are divided into operation classes such as read, write, or sync.
- * This helps keep latency and throughput consistent and prevents slow paths
- * from poisoning fast paths.
- *
- * The tricky bit is that we want to avoid frequent vmspace changes, so
- * workers need to be fed in such a way as to balance the load while at
- * the same time being efficient about vmspace switches.
- *
- * How expensive is a vmspace switch?  The costly part is pmap_activate(), which
- * does TLB invalidation IPIs.
- *
- * To improve vmspace affinity, we use check the user process pointer for the
- * tail of the worker's IO queue as a hint for worker affinity.  The issuer
- * first checks the local workers for the least-busy affine worker.  Failing
- * success in the first pass, the issuer then tries to select the least-busy
- * local worker.  If the second pass fails, the issuer consults the source's
- * policy for controlled behavior under load.
- *
- * TODO: The above algorithm was intended for use with bounded worker queues.
- * Revision to refer to policy for acceptable queue lengths is required.
- * TODO: Implement the mentioned policies for controlled behavior under load.
- *
- * We want to stay on the same CPU as the user thread accessing the IO buffers,
- * for cache locality.  Scheduling should select the local CPU issuer until
- * local workers are all busy.  But, we also want to utilize idle CPU time to
- * minimize latency and maximize throughput.  Optimizing the balance of these
- * priorities is the role of the policy.
+ * specialized for specific IO types (read, write, socket, etc).  Instead,
+ * issuer threads dequeue work from the user and delegate it to workers.
  */
 struct rio_worker {
 	struct mtx		rw_lock;
@@ -891,6 +858,59 @@ rio_worker_dequeue(struct rio_worker *worker, struct rio_srcio **srciop)
 	worker->rw_len--;
 	mtx_unlock(&worker->rw_lock);
 	*srciop = srcio;
+	return (0);
+}
+
+/*
+ * The workers are divided into operation classes such as read, write, or sync.
+ * This helps keep latency and throughput consistent and prevents slow paths
+ * from poisoning fast paths.
+ */
+struct rio_flow {
+	struct rio_issuer rf_issuer;
+	struct rio_worker *rf_read;
+	struct rio_worker *rf_write;
+	struct rio_worker *rf_sync;
+	/* TODO: other worker classes */
+};
+DPCPU_DEFINE_STATIC(struct rio_flow, rio_flow);
+
+static inline struct rio_worker *
+rio_flow_classify(struct rio_flow *flow, struct rio_srcio *srcio, u_int *lenp)
+{
+	switch (rio_io_cmd(srcio->rs_io)) {
+	case RIO_READ:
+		*lenp = rio_flow_read_workers;
+		return (flow->rf_read);
+	case RIO_WRITE:
+		*lenp = rio_flow_write_workers;
+		return (flow->rf_write);
+	case RIO_SYNC:
+	case RIO_DSYNC:
+	case RIO_MLOCK: /* ? */
+		*lenp = rio_flow_sync_workers;
+		return (flow->rf_sync);
+	/* TODO: others */
+	}
+	__assert_unreachable();
+}
+
+/* TODO: schedulers deep dive */
+/* XXX: this is a potentially confusing name */
+static int
+rio_src_scheduler_none(struct rio_softc *sc)
+{
+	struct rio_src *src;
+	struct rio_flow *flow;
+	struct rio_issuer *issuer;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	/* Try the local flow first. */
+	flow = DPCPU_PTR(rio_flow);
+	issuer = &flow->rf_issuer;
+	/* TODO: policy-based queue depth, spread */
+	rio_issuer_enqueue(issuer, src);
 	return (0);
 }
 
@@ -1003,6 +1023,30 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 	}
 }
 
+/*
+ * The tricky bit is that we want to avoid frequent vmspace changes, so
+ * workers need to be fed in such a way as to balance the load while at
+ * the same time being efficient about vmspace switches.
+ *
+ * How expensive is a vmspace switch?  The costly part is pmap_activate(), which
+ * does TLB invalidation IPIs.
+ *
+ * To improve vmspace affinity, we save the user process pointer for the tail of
+ * the worker's IO queue as a hint for worker affinity.  The scheduler first
+ * checks the local workers for an idle affine worker.  Failing success in the
+ * first pass, the scheduler then tries to select any idle local worker.  If the
+ * second pass fails, the scheduler tries to select the least-busy affine local
+ * worker.  If there are no local workers with a queue depth below a policy-
+ * defined threshold, the scheduler will repeat the process for remote workers.
+ *
+ * TODO: Implement the remote work policies for controlled behavior under load.
+ *
+ * We want to stay on the same CPU as the user thread accessing the IO buffers,
+ * for cache locality.  Scheduling should select the local CPU issuer until
+ * local workers are all busy.  But, we also want to utilize idle CPU time to
+ * minimize latency and maximize throughput.  Optimizing the balance of these
+ * priorities is the role of the policy.
+ */
 struct rio_scheduler {
 	struct rio_selector	rs_sel;
 	int	*rs_seq;	/* XXX: stale reads should be good enough */
@@ -1014,7 +1058,22 @@ rio_scheduler_init(struct rio_scheduler *sched, struct rio_issuer *issuer)
 	sched->rs_seq = &issuer->ri_seq;
 	rio_selector_init(&sched->rs_sel, UIMAX(rio_flow_read_workers,
 	    rio_flow_write_workers, rio_flow_sync_workers));
-	/* TODO: more worker classes */
+	/* TODO: more worker classes? */
+}
+
+static inline void
+rio_scheduler_reset(struct rio_scheduler *sched, struct rio_worker *workers,
+    u_int len, struct rio_srcio *srcio)
+{
+	struct rio_selector *sel = &sched->rs_sel;
+
+	rio_selector_reset(sel);
+	MPASS(len > 0);
+	for (u_int i = 0; i < len; i++) {
+		rio_selector_insert(sel, srcio, workers + i);
+	}
+	MPASS(sel->rs_n == len);
+	MPASS(sel->rs_min != UINT_MAX);
 }
 
 static inline struct rio_worker *
@@ -1098,74 +1157,14 @@ rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
 	return (workers + sel->rs_indices[*sched->rs_seq % count]);
 }
 
-static inline void
-rio_scheduler_destroy(struct rio_scheduler *sched)
-{
-	rio_selector_destroy(&sched->rs_sel);
-}
-
-
-/* TODO: remote flow selection process */
-
-struct rio_flow {
-	struct rio_issuer rf_issuer;
-	struct rio_worker *rf_read;
-	struct rio_worker *rf_write;
-	struct rio_worker *rf_sync;
-	/* TODO: other worker classes */
-};
-DPCPU_DEFINE_STATIC(struct rio_flow, rio_flow);
-
-/* TODO: schedulers deep dive */
-static int
-rio_src_scheduler_none(struct rio_softc *sc)
-{
-	struct rio_src *src;
-	struct rio_flow *flow;
-	struct rio_issuer *issuer;
-
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
-	/* Try the local flow first. */
-	flow = DPCPU_PTR(rio_flow);
-	issuer = &flow->rf_issuer;
-	/* TODO: policy-based queue depth, spread */
-	rio_issuer_enqueue(issuer, src);
-	return (0);
-}
-
-static inline struct rio_worker *
-rio_srcio_class(struct rio_srcio *srcio, struct rio_flow *flow, u_int *lenp)
-{
-	switch (rio_io_cmd(srcio->rs_io)) {
-	case RIO_READ:
-		*lenp = rio_flow_read_workers;
-		return (flow->rf_read);
-	case RIO_WRITE:
-		*lenp = rio_flow_write_workers;
-		return (flow->rf_write);
-	case RIO_SYNC:
-	case RIO_DSYNC:
-	case RIO_MLOCK: /* ? */
-		*lenp = rio_flow_sync_workers;
-		return (flow->rf_sync);
-	/* TODO: others */
-	}
-	__assert_unreachable();
-}
-
 /* Try selecting the least-busy affine worker. */
 static inline struct rio_worker *
-rio_srcio_select_worker(struct rio_srcio *srcio, struct rio_scheduler *sched,
-    struct rio_worker *workers, u_int len)
+rio_scheduler_select_worker(struct rio_scheduler *sched,
+    struct rio_worker *workers, u_int len, struct rio_srcio *srcio)
 {
 	struct rio_worker *worker;
-	struct rio_selector *sel = &sched->rs_sel;
 
-	rio_selector_reset(sel);
-	for (u_int i = 0; i < len; i++) {
-		rio_selector_insert(sel, srcio, workers + i);
-	}
+	rio_scheduler_reset(sched, workers, len, srcio);
 	if ((worker = rio_scheduler_ideal(sched, workers)) != NULL) {
 		return (worker);
 	}
@@ -1179,12 +1178,15 @@ rio_srcio_select_worker(struct rio_srcio *srcio, struct rio_scheduler *sched,
 }
 
 /*
+ * TODO: This comment is no longer true?  Switch back to directly completing
+ * errors from any thread...
  * Errors in the issue stage still have to be scheduled to a worker because
  * completion requires switching vmspace to match the user process (for umtx).
  */
+/* XXX: get rid of this */
 static inline void
-rio_srcio_schedule_error(struct rio_srcio *srcio, struct rio_scheduler *sched,
-    int error)
+rio_scheduler_schedule_error(struct rio_scheduler *sched,
+    struct rio_srcio *srcio, int error)
 {
 	struct rio_flow *flow;
 	struct rio_worker *worker;
@@ -1194,13 +1196,13 @@ rio_srcio_schedule_error(struct rio_srcio *srcio, struct rio_scheduler *sched,
 	/* Try local flow first. */
 	flow = DPCPU_PTR(rio_flow);
 	/* Reuse the sync workers for issuer errors. */
-	worker = rio_srcio_select_worker(srcio, sched, flow->rf_sync,
-	    rio_flow_sync_workers);
+	worker = rio_scheduler_select_worker(sched, flow->rf_sync,
+	    rio_flow_sync_workers, srcio);
 	rio_worker_enqueue(worker, srcio);
 }
 
 static inline void
-rio_srcio_schedule(struct rio_srcio *srcio, struct rio_scheduler *sched)
+rio_scheduler_schedule(struct rio_scheduler *sched, struct rio_srcio *srcio)
 {
 	struct rio_flow *flow;
 	struct rio_worker *workers, *worker;
@@ -1208,10 +1210,18 @@ rio_srcio_schedule(struct rio_srcio *srcio, struct rio_scheduler *sched)
 
 	/* Try local flow first. */
 	flow = DPCPU_PTR(rio_flow);
-	workers = rio_srcio_class(srcio, flow, &len);
-	worker = rio_srcio_select_worker(srcio, sched, workers, len);
+	workers = rio_flow_classify(flow, srcio, &len);
+	worker = rio_scheduler_select_worker(sched, workers, len, srcio);
 	rio_worker_enqueue(worker, srcio);
 }
+
+static inline void
+rio_scheduler_destroy(struct rio_scheduler *sched)
+{
+	rio_selector_destroy(&sched->rs_sel);
+}
+
+/* TODO: remote flow selection process */
 
 /* TODO: tunable, tuning */
 static u_int rio_attention_span = 1024; /* IO batching parameter */
@@ -1244,15 +1254,9 @@ next:
 			uma_zfree(rio_src_zone, src);
 			continue;
 		}
-		/* TODO: Check if PROC_LOCK() is required around this. */
 		td = FIRST_THREAD_IN_PROC(sc->sc_proc);
 
-		/*
-		 * TODO: We want to avoid interleaving IO from different
-		 * processes in the same worker, to minimize vmspace switches in
-		 * the workers.  The CPU scheduler will take care of
-		 * interleaving the workers on CPU.
-		 */
+		/* TODO: Policy-based attention span. */
 		for (issued = 0; issued < rio_attention_span; issued++) {
 			struct rio_srcio *srcio;
 			struct rio_io *io;
@@ -1293,10 +1297,12 @@ next:
 				break;
 			}
 			if (__predict_false(error != 0)) {
-				rio_srcio_schedule_error(srcio, &sched, error);
+				/* TODO: just complete it, no vmspace switch */
+				rio_scheduler_schedule_error(&sched, srcio,
+				    error);
 				break;
 			}
-			rio_srcio_schedule(srcio, &sched);
+			rio_scheduler_schedule(&sched, srcio);
 		}
 		rio_issuer_enqueue(self, src);
 	}
@@ -1330,6 +1336,8 @@ rio_worker_proc(void *arg)
 			break;
 		}
 		/*
+		 * TODO: This comment is no longer true?  Switch back to lazy
+		 * vmspace switching...
 		 * Every completion requires us to adopt the vmspace of the
 		 * user process.  We're not AIO, but close enough.
 		 */
@@ -1349,7 +1357,8 @@ rio_worker_proc(void *arg)
 			self->rw_handler(srcio);
 		}
 		rio_srcio_complete(srcio);
-		/* TODO: Switch back to myvm when user process exits? */
+		/* TODO: Stay in user process vmspace until process exits. */
+		vmspace_switch_aio(myvm);
 	}
 	vmspace_switch_aio(myvm);
 	vmspace_free(myvm);
@@ -1472,7 +1481,7 @@ rio_load(void)
 			/* TODO: error handling */
 			return (error);
 		}
-		/* TODO: more worker classes */
+		/* TODO: more worker classes? */
 	}
 	return (0);
 }
@@ -1550,7 +1559,7 @@ rio_shutdown(void)
 		rio_workerclass_destroy(flow, read);
 		rio_workerclass_destroy(flow, write);
 		rio_workerclass_destroy(flow, sync);
-		/* TODO: more worker classes */
+		/* TODO: more worker classes? */
 	}
 	taskqueue_quiesce(rio_doom);
 	taskqueue_free(rio_doom);
