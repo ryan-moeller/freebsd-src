@@ -33,7 +33,6 @@ struct _rio {
 static int
 gettime(const struct ck_ec_ops *op __unused, struct timespec *out)
 {
-	/* TODO: reevaluate clock selection */
 	return (clock_gettime(CLOCK_MONOTONIC, out));
 }
 
@@ -41,10 +40,14 @@ static void
 wait32(const struct ck_ec_wait_state *state __unused, const uint32_t *address,
     uint32_t expected, const struct timespec *deadline)
 {
-	/* TODO: EINTR? */
-	_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAIT_UINT_PRIVATE,
+	if (_umtx_op(__DECONST(uint32_t *, address), UMTX_OP_WAIT_UINT_PRIVATE,
 	    expected, (void *)(uintptr_t)sizeof(*deadline),
-	    __DECONST(struct timespec *, deadline));
+	    __DECONST(struct timespec *, deadline)) == -1) {
+		int error = errno;
+
+		/* TODO: How to handle errors? EINTR? */
+		(void)error;
+	}
 }
 
 static void
@@ -83,7 +86,7 @@ rio_reserve(rio_t rio, const struct timespec *deadline)
 			memset(iocb, 0, sizeof(*iocb));
 			return (iocb);
 		}
-		/* TODO: variation with predicate? */
+		/* TODO: variation with predicate? How to handle EINTR? */
 		if (ck_ec_wait(&rio->rio_freelist_nqc, &rio_ec_umtx_mode, value,
 		    deadline) == -1) {
 			return (NULL);
@@ -109,9 +112,9 @@ rio_enqueue(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 			    &rio_ec_umtx_mode);
 			return (0);
 		}
-		/* TODO: predicates? */
-		if (ck_ec_wait(&shm->rio_submission.rr_dqc,
-		    &rio_ec_umtx_mode, value, deadline) == -1) {
+		/* TODO: predicates? how to handle EINTR? */
+		if (ck_ec_wait(&shm->rio_submission.rr_dqc, &rio_ec_umtx_mode,
+		    value, deadline) == -1) {
 			return (-1);
 		}
 	}
@@ -119,7 +122,7 @@ rio_enqueue(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 }
 
 /* Return a control block to the freelist. */
-static void
+static inline void
 rio_return(rio_t rio, struct riocb *iocb)
 {
 	struct rio_slot slot;
