@@ -4,7 +4,7 @@
  * Copyright (c) 2026 Ryan Moeller
  */
 
-#include <sys/types.h>
+#include <sys/param.h>
 #include <sys/mman.h>
 #include <sys/umtx.h>
 #include <errno.h>
@@ -164,16 +164,26 @@ rio_create(rio_t *riop, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid)
 	rio_t rio;
 	void *p;
 	size_t size;
+	u_int freelist_size;
 	int fd, error;
 
-	if (riop == NULL) {
+	if (riop == NULL ||
+	    !(powerof2(sqlen) && powerof2(cqlen) && powerof2(ncb))) {
 		errno = EINVAL;
 		return (-1);
 	}
 	if ((rio = malloc(sizeof(*rio))) == NULL) {
 		return (-1);
 	}
-	if ((slots = calloc(ncb, sizeof(*slots))) == NULL) {
+	/*
+	 * Rings must be a power of 2 size and always waste one slot.  Double
+	 * the size of the freelist ring buffer to ensure we can supply the
+	 * requested number of control blocks.  The rest of the ring sizes are
+	 * still off by one, but those are rings the user is expected to be
+	 * aware of.  The freelist is a hidden implementation detail.
+	 */
+	freelist_size = ncb * 2;
+	if ((slots = calloc(freelist_size, sizeof(*slots))) == NULL) {
 		error = errno;
 		goto error_free;
 	}
@@ -201,12 +211,13 @@ rio_create(rio_t *riop, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid)
 		goto error_munmap;
 	}
 	rio->rio_mapped = p;
-	ck_ring_init(&rio->rio_freelist, ncb);
-	ck_ec_init(&rio->rio_freelist_nqc, 0);
-	/* The freelist doesn't need the dequeue event counter. */
+	ck_ring_init(&rio->rio_freelist, freelist_size);
+	/* Only populate ncb slots in the freelist. */
 	for (struct rio_slot slot = {0}; slot.rs_index < ncb; slot.rs_index++) {
-		CK_RING_ENQUEUE_SPSC(rio, &rio->rio_freelist, slots, &slot);
+		CK_RING_ENQUEUE_MPMC(rio, &rio->rio_freelist, slots, &slot);
 	}
+	ck_ec_init(&rio->rio_freelist_nqc, ncb);
+	/* The freelist doesn't need a dequeue event counter. */
 	rio->rio_freelist_slots = slots;
 	rio->rio_submission_slots = rio_submission_slots(p, &conf);
 	rio->rio_completion_slots = rio_completion_slots(p, &conf);

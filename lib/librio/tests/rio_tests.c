@@ -15,6 +15,7 @@
 
 #include <atf-c.h>
 
+/* ring sizes (must be power of 2) */
 #define SQLEN	32
 #define CQLEN	32
 #define NCB	64
