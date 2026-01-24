@@ -617,7 +617,7 @@ rio_srcio_complete(struct rio_srcio *srcio)
 		__assert_unreachable();
 	}
 	counter_u64_add(sc->sc_inflight, -1);
-	if (__predict_false(error == ESHUTDOWN) &&
+	if (__predict_false(error != 0) &&
 	    __predict_false(counter_u64_fetch(sc->sc_inflight) == 0)) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	}
