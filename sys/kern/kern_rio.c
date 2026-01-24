@@ -27,6 +27,7 @@
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/stat.h>
+#include <sys/sx.h>
 #include <sys/syscallsubr.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -116,6 +117,7 @@ struct rio_softc {
 	struct rio_io	*sc_io;		/* kernel-private IO control blocks */
 	struct ucred	*sc_cred;	/* user credentials */
 	struct proc	*sc_proc;	/* user process */
+	struct vmspace	*sc_vmspace;	/* user process vmspace */
 	vm_offset_t	sc_urio;	/* user address of SHM object */
 	size_t		sc_size;	/* for vm_map_remove */
 	u_int		sc_ncb;		/* number of control blocks */
@@ -123,6 +125,7 @@ struct rio_softc {
 	/* TODO: policy metadata */
 	struct task	sc_destroy_task;/* destruction task */
 	boolean_t	sc_doomed;	/* impending doom */
+	struct sx	sc_doom_lock;	/* block doom while issuing */
 	counter_u64_t	sc_inflight;	/* #io issued and not yet completed */
 	/* TODO: flags? more counters? */
 	/*
@@ -147,6 +150,7 @@ rio_open(struct rio_softc **scp)
 		free(sc, M_RIO);
 		return (ESHUTDOWN);
 	}
+	sx_init(&sc->sc_doom_lock, "rio doom lock");
 	LIST_INSERT_HEAD(&rio_handles, sc, sc_handles);
 	rio_open_count++;
 	mtx_unlock(&rio_shutdown_lock);
@@ -164,6 +168,7 @@ rio_close(struct rio_softc *sc)
 		cv_signal(&rio_shutdown_cond);
 	}
 	mtx_unlock(&rio_shutdown_lock);
+	sx_destroy(&sc->sc_doom_lock);
 	free(sc, M_RIO);
 }
 
@@ -278,6 +283,7 @@ rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
 
 		ck_ec_inc(&rio->rio_submission.rr_dqc, &sc->sc_ec_umtx_mode);
 		if (__predict_true(index < sc->sc_ncb)) {
+			counter_u64_add(sc->sc_inflight, 1);
 			*indexp = index;
 			return (&rio->rio_control[index]);
 		}
@@ -296,6 +302,7 @@ rio_completions_enqueue_pred(const struct ck_ec_wait_state *state,
 	if (__predict_false(rio_doomed(sc))) {
 		return (ECANCELED);
 	}
+	/* TODO: Won't this hang the user process waiting for completions? */
 	if (__predict_false(rio_shuttingdown())) {
 		return (ESHUTDOWN);
 	}
@@ -341,7 +348,7 @@ rio_destroy_task(void *arg, int pending __unused)
 	size_t size;
 
 	crfree(sc->sc_cred);
-	PRELE(sc->sc_proc);
+	vmspace_free(sc->sc_vmspace);
 	/*
 	 * The object can stay mapped even if the shmfd is closed or the user
 	 * process exits.  Unmap the object directly instead of requiring the
@@ -359,8 +366,10 @@ rio_destroy_task(void *arg, int pending __unused)
 void
 rio_destroy(struct rio_softc *sc)
 {
-	atomic_store_rel_int(&sc->sc_doomed, true);
-	smp_rendezvous(NULL, NULL, NULL, NULL);
+	sx_xlock(&sc->sc_doom_lock);
+	/* The sx ensures ordering and visibility to atomic readers. */
+	sc->sc_doomed = true;
+	sx_xunlock(&sc->sc_doom_lock);
 	if (counter_u64_fetch(sc->sc_inflight) == 0) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	} else {
@@ -388,7 +397,7 @@ rio_ring_init(struct rio_ring *ring, u_int size)
 static inline vm_offset_t
 rio_shm_uaddr(struct rio_softc *sc, struct shmfd *shmfd)
 {
-	vm_map_t map = &sc->sc_proc->p_vmspace->vm_map;
+	vm_map_t map = &sc->sc_vmspace->vm_map;
 	vm_map_entry_t entry;
 	vm_offset_t uaddr = 0;
 
@@ -415,7 +424,8 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 
 	MPASS(fp->f_type == DTYPE_SHM);
 	shmfd = fp->f_data;
-	if (conf->rio_policy_id >= nitems(rio_src_policies)) {
+	if (shmfd->shm_path != NULL ||
+	    conf->rio_policy_id >= nitems(rio_src_policies)) {
 		return (EINVAL);
 	}
 	if ((error = rio_open(&sc)) != 0) {
@@ -428,7 +438,8 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 		return (error);
 	}
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
-	PHOLD((sc->sc_proc = td->td_proc));
+	sc->sc_proc = td->td_proc;
+	sc->sc_vmspace = vmspace_acquire_ref(sc->sc_proc);
 	rio = sc->sc_rio;
 	rio_ring_init(&rio->rio_submission, conf->rio_sqlen);
 	rio_ring_init(&rio->rio_completion, conf->rio_cqlen);
@@ -578,14 +589,6 @@ rio_srcio_canceled(struct rio_srcio *srcio)
 	    == ECANCELED);
 }
 
-static inline int
-rio_srcio_fdrop(struct rio_srcio *srcio)
-{
-	struct thread *td = FIRST_THREAD_IN_PROC(srcio->rs_sc->sc_proc);
-
-	return (fdrop(srcio->rs_io->rio_fd_file, td));
-}
-
 static inline void
 rio_srcio_complete(struct rio_srcio *srcio)
 {
@@ -597,7 +600,7 @@ rio_srcio_complete(struct rio_srcio *srcio)
 
 	/* Must release resources before io can be reused. */
 	if (io->rio_fd_file != NULL) {
-		rio_srcio_fdrop(srcio);
+		fdrop(io->rio_fd_file, NULL);
 	}
 	index = rio_srcio_index(srcio);
 	kiocb = &io->rio_cb;
@@ -638,6 +641,13 @@ rio_srcio_proc(struct rio_srcio *srcio)
 	return (srcio->rs_sc->sc_proc);
 }
 
+static inline void
+rio_srcio_vmspace_switch(struct rio_srcio *srcio)
+{
+	/* We aren't AIO, but close enough. */
+	vmspace_switch_aio(srcio->rs_sc->sc_vmspace);
+}
+
 static void
 rio_srcio_read(struct rio_srcio *srcio)
 {
@@ -652,6 +662,7 @@ rio_srcio_read(struct rio_srcio *srcio)
 	ssize_t len;
 	u_int flags;
 
+	rio_srcio_vmspace_switch(srcio);
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
@@ -704,6 +715,7 @@ rio_srcio_write(struct rio_srcio *srcio)
 	ssize_t len;
 	u_int flags;
 
+	rio_srcio_vmspace_switch(srcio);
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
@@ -763,6 +775,7 @@ rio_srcio_sync(struct rio_srcio *srcio)
 	int error = 0;
 
 	if (cmd == RIO_MLOCK) {
+		rio_srcio_vmspace_switch(srcio);
 		/*
 		 * TODO: After the commands are fleshed out, see if it is
 		 * possible to make ident an int and use the rio_data/rio_buf
@@ -826,10 +839,8 @@ struct rio_worker {
 static inline void
 rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 {
-	struct rio_softc *sc = srcio->rs_sc;
 	bool wake;
 
-	counter_u64_add(sc->sc_inflight, 1);
 	mtx_lock(&worker->rw_lock);
 	wake = STAILQ_EMPTY(&worker->rw_srcios);
 	STAILQ_INSERT_TAIL(&worker->rw_srcios, srcio, rs_srcios);
@@ -1177,30 +1188,6 @@ rio_scheduler_select_worker(struct rio_scheduler *sched,
 	return (rio_scheduler_depth(sched, workers));
 }
 
-/*
- * TODO: This comment is no longer true?  Switch back to directly completing
- * errors from any thread...
- * Errors in the issue stage still have to be scheduled to a worker because
- * completion requires switching vmspace to match the user process (for umtx).
- */
-/* XXX: get rid of this */
-static inline void
-rio_scheduler_schedule_error(struct rio_scheduler *sched,
-    struct rio_srcio *srcio, int error)
-{
-	struct rio_flow *flow;
-	struct rio_worker *worker;
-
-	srcio->rs_io->rio_cb.rio_error = error;
-	srcio->rs_io->rio_cb.rio_status = -1;
-	/* Try local flow first. */
-	flow = DPCPU_PTR(rio_flow);
-	/* Reuse the sync workers for issuer errors. */
-	worker = rio_scheduler_select_worker(sched, flow->rf_sync,
-	    rio_flow_sync_workers, srcio);
-	rio_worker_enqueue(worker, srcio);
-}
-
 static inline void
 rio_scheduler_schedule(struct rio_scheduler *sched, struct rio_srcio *srcio)
 {
@@ -1250,7 +1237,13 @@ next:
 			break;
 		}
 		sc = src->rs_sc;
-		if (__predict_false(rio_doomed(sc))) {
+		/*
+		 * The shared lock prevents the SHM file from closing and the
+		 * process exiting while we're using the process's file table.
+		 */
+		sx_slock(&sc->sc_doom_lock);
+		if (__predict_false(sc->sc_doomed)) {
+			sx_sunlock(&sc->sc_doom_lock);
 			uma_zfree(rio_src_zone, src);
 			continue;
 		}
@@ -1266,6 +1259,7 @@ next:
 
 			if ((iocb = rio_submissions_trydequeue(sc, &index))
 			    == NULL) {
+				sx_sunlock(&sc->sc_doom_lock);
 				goto next;
 			}
 			srcio = uma_zalloc(rio_srcio_zone, M_WAITOK);
@@ -1297,13 +1291,12 @@ next:
 				break;
 			}
 			if (__predict_false(error != 0)) {
-				/* TODO: just complete it, no vmspace switch */
-				rio_scheduler_schedule_error(&sched, srcio,
-				    error);
+				rio_srcio_error(srcio, error);
 				break;
 			}
 			rio_scheduler_schedule(&sched, srcio);
 		}
+		sx_sunlock(&sc->sc_doom_lock);
 		rio_issuer_enqueue(self, src);
 	}
 	rio_scheduler_destroy(&sched);
@@ -1335,13 +1328,6 @@ rio_worker_proc(void *arg)
 			/* ESHUTDOWN */
 			break;
 		}
-		/*
-		 * TODO: This comment is no longer true?  Switch back to lazy
-		 * vmspace switching...
-		 * Every completion requires us to adopt the vmspace of the
-		 * user process.  We're not AIO, but close enough.
-		 */
-		vmspace_switch_aio(rio_srcio_proc(srcio)->p_vmspace);
 		/* Check for close. */
 		if (__predict_false(rio_doomed(srcio->rs_sc))) {
 			rio_srcio_error(srcio, ECANCELED);
@@ -1357,8 +1343,17 @@ rio_worker_proc(void *arg)
 			self->rw_handler(srcio);
 		}
 		rio_srcio_complete(srcio);
-		/* TODO: Stay in user process vmspace until process exits. */
-		vmspace_switch_aio(myvm);
+		/*
+		 * TODO: Workers should return to their own vmspace to release
+		 * the user process vmspace when the user process goes away.
+		 * Otherwise we may be holding a large vmspace until another
+		 * srcio gets us to switch.
+		 *
+		 * This could probably be based on either a work dequeue timeout
+		 * or an event handler for process exit that scans all workers.
+		 * The event handler would probably need a lot of machinery.  A
+		 * timeout could actually drive autoscaling worker threads.
+		 */
 	}
 	vmspace_switch_aio(myvm);
 	vmspace_free(myvm);
