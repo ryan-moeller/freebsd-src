@@ -71,7 +71,7 @@ static const u_int rio_flow_sync_workers = 4;
 static struct taskqueue *rio_doom;
 
 /* Shutdown handling. */
-static u_int rio_hold_count;
+static u_int rio_open_count;
 static struct mtx rio_shutdown_lock;
 MTX_SYSINIT(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
     MTX_DEF);
@@ -84,30 +84,6 @@ static inline bool
 rio_shuttingdown(void)
 {
 	return (atomic_load_acq_int(&rio_shutdown_pending));
-}
-
-static inline int
-rio_tryhold(void)
-{
-	mtx_lock(&rio_shutdown_lock);
-	if (rio_shuttingdown()) {
-		mtx_unlock(&rio_shutdown_lock);
-		return (ESHUTDOWN);
-	}
-	rio_hold_count++;
-	mtx_unlock(&rio_shutdown_lock);
-	return (0);
-}
-
-static inline void
-rio_drop(void)
-{
-	mtx_lock(&rio_shutdown_lock);
-	rio_hold_count--;
-	if (rio_hold_count == 0 && rio_shuttingdown()) {
-		cv_signal(&rio_shutdown_cond);
-	}
-	mtx_unlock(&rio_shutdown_lock);
 }
 
 /* kernel-private IO control block */
@@ -129,6 +105,9 @@ rio_io_flags(struct rio_io *io)
 {
 	return (io->rio_cb.rio_cmd & RIO_CMD_FLAGS);
 }
+
+/* list of all handles for debugging, protected by shutdown lock */
+static LIST_HEAD(, rio_softc) rio_handles;
 
 struct rio_softc {
 	struct rio	*sc_rio;	/* kernel address of SHM object */
@@ -153,7 +132,40 @@ struct rio_softc {
 	 */
 	struct ck_ec_ops	sc_ec_umtx_ops;
 	struct ck_ec_mode	sc_ec_umtx_mode;
+	LIST_ENTRY(rio_softc)	sc_handles;
 };
+
+static inline int
+rio_open(struct rio_softc **scp)
+{
+	struct rio_softc *sc;
+
+	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
+	mtx_lock(&rio_shutdown_lock);
+	if (rio_shuttingdown()) {
+		mtx_unlock(&rio_shutdown_lock);
+		free(sc, M_RIO);
+		return (ESHUTDOWN);
+	}
+	LIST_INSERT_HEAD(&rio_handles, sc, sc_handles);
+	rio_open_count++;
+	mtx_unlock(&rio_shutdown_lock);
+	*scp = sc;
+	return (0);
+}
+
+static inline void
+rio_close(struct rio_softc *sc)
+{
+	mtx_lock(&rio_shutdown_lock);
+	LIST_REMOVE(sc, sc_handles);
+	rio_open_count--;
+	if (rio_open_count == 0 && rio_shuttingdown()) {
+		cv_signal(&rio_shutdown_cond);
+	}
+	mtx_unlock(&rio_shutdown_lock);
+	free(sc, M_RIO);
+}
 
 static inline bool
 rio_doomed(struct rio_softc *sc)
@@ -341,8 +353,7 @@ rio_destroy_task(void *arg, int pending __unused)
 	vm_map_remove(kernel_map, kva, kva + size);
 	counter_u64_free(sc->sc_inflight);
 	free(sc->sc_io, M_RIO);
-	free(sc, M_RIO);
-	rio_drop();
+	rio_close(sc);
 }
 
 void
@@ -407,15 +418,13 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	if (conf->rio_policy_id >= nitems(rio_src_policies)) {
 		return (EINVAL);
 	}
-	if ((error = rio_tryhold()) != 0) {
+	if ((error = rio_open(&sc)) != 0) {
 		return (error);
 	}
-	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
 	size = rio_config_size(conf);
 	/* TODO: Will mmap enforce size limits for us? */
 	if ((error = shm_map(fp, size, 0, (void **)&sc->sc_rio)) != 0) {
-		rio_drop();
-		free(sc, M_RIO);
+		rio_close(sc);
 		return (error);
 	}
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
@@ -1529,7 +1538,7 @@ rio_shutdown(void)
 
 	mtx_lock(&rio_shutdown_lock);
 	atomic_store_rel_int(&rio_shutdown_pending, true);
-	while (rio_hold_count > 0) {
+	while (rio_open_count > 0) {
 		cv_wait(&rio_shutdown_cond, &rio_shutdown_lock);
 	}
 	mtx_unlock(&rio_shutdown_lock);
