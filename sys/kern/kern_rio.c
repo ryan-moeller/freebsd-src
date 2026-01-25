@@ -629,14 +629,14 @@ rio_srcio_index(struct rio_srcio *srcio)
 	return (srcio->rs_io - srcio->rs_sc->sc_io);
 }
 
-static inline int
+static inline bool
 rio_srcio_canceled(struct rio_srcio *srcio)
 {
 	struct rio *rio = srcio->rs_sc->sc_rio;
 	uint32_t index = rio_srcio_index(srcio);
 
-	return (atomic_load_int(&rio->rio_control[index].rio_error)
-	    == ECANCELED);
+	return (srcio->rs_io->rio_cb.rio_error == ECANCELED ||
+	    atomic_load_int(&rio->rio_control[index].rio_error) == ECANCELED);
 }
 
 static inline void
