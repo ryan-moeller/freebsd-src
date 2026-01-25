@@ -109,10 +109,9 @@ rio_config_size(const struct rio_config *conf)
 #ifdef RIO
 #include <sys/file.h>
 
-struct rio_softc;
-
 fo_ioctl_t rio_ioctl;
 void rio_destroy(struct rio_softc *);
+void rio_vmspace_exit(struct vmspace *);
 #endif /* RIO */
 #endif /* _KERNEL */
 
