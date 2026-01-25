@@ -184,15 +184,13 @@ struct rio_softc {
 	struct proc	*sc_proc;	/* user process */
 	struct vmspace	*sc_vmspace;	/* user process vmspace */
 	vm_offset_t	sc_urio;	/* user address of SHM object */
-	size_t		sc_size;	/* for vm_map_remove */
-	u_int		sc_ncb;		/* number of control blocks */
-	u_int		sc_policy_id;	/* scheduling policy */
 	/* TODO: policy metadata */
 	struct task	sc_destroy_task;/* destruction task */
 	enum rio_status	sc_status;	/* softc/process status */
 	struct sx	sc_status_lock;	/* block status change while issuing */
-	counter_u64_t	sc_inflight;	/* #io issued and not yet completed */
-	/* TODO: flags? more counters? */
+	struct mtx	sc_issuer_lock;	/* for submission dequeue accounting */
+	/* TODO: flags? counters? */
+	struct rio_config	sc_config;
 	/*
 	 * XXX: As a workaround for not having context in wake32, we have to
 	 * embed the CK event counter ops and mode in every softc so the ops
@@ -215,7 +213,8 @@ rio_open(struct rio_softc **scp)
 		free(sc, M_RIO);
 		return (ESHUTDOWN);
 	}
-	sx_init(&sc->sc_status_lock, "rio status lock");
+	sx_init(&sc->sc_status_lock, "rio softc status lock");
+	mtx_init(&sc->sc_issuer_lock, "rio softc issuer lock", NULL, MTX_DEF);
 	LIST_INSERT_HEAD(&rio_handles, sc, sc_handles);
 	rio_open_count++;
 	mtx_unlock(&rio_shutdown_lock);
@@ -234,6 +233,7 @@ rio_close(struct rio_softc *sc)
 	}
 	mtx_unlock(&rio_shutdown_lock);
 	sx_destroy(&sc->sc_status_lock);
+	mtx_destroy(&sc->sc_issuer_lock);
 	free(sc, M_RIO);
 }
 
@@ -260,6 +260,7 @@ rio_uaddr(struct rio_softc *sc, const uint32_t *address)
 	return ((void *)uaddr);
 }
 
+#if 0 /* keeping this code around for later use in polling */
 static void
 rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
     uint32_t expected, const struct timespec *deadline)
@@ -311,10 +312,10 @@ rio_ec_umtx_wait(const struct ck_ec_wait_state *state, const uint32_t *address,
 		break;
 	}
 }
+#endif
 
-/* Wake any number of waiters. */
 static inline void
-rio_ec_umtx_wake_n(const struct ck_ec_ops *ops, const uint32_t *address, int n)
+rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
 {
 	struct rio_softc *sc;
 	void *uaddr;
@@ -322,33 +323,39 @@ rio_ec_umtx_wake_n(const struct ck_ec_ops *ops, const uint32_t *address, int n)
 
 	sc = __containerof(ops, struct rio_softc, sc_ec_umtx_ops);
 	uaddr = rio_uaddr(sc, address);
-	if ((error = umtx_wake(sc->sc_proc, uaddr, n, true)) != 0) {
+	/* Wake a single waiter. */
+	if ((error = umtx_wake(sc->sc_proc, uaddr, 1, true)) != 0) {
 		/* TODO: handle error somehow */
 		printf("%s: umtx_wake: error=%d\n", __func__, error);
 	}
 }
 
-/* Wake a single waiter. */
-static void
-rio_ec_umtx_wake_1(const struct ck_ec_ops *ops, const uint32_t *address)
+static inline uint32_t
+rio_inflight(struct rio_softc *sc)
 {
-	rio_ec_umtx_wake_n(ops, address, 1);
+	struct rio *rio = sc->sc_rio;
+	uint32_t s = ck_ec_value(&rio->rio_submission.rr_dqc);
+	uint32_t c = ck_ec_value(&rio->rio_completion.rr_dqc);
+
+	return (s - c);
 }
 
 static inline struct riocb *
-rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
+rio_submissions_trydequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 {
 	struct rio_slot slot;
-	struct rio *rio;
+	struct rio *rio = sc->sc_rio;
 
-	rio = sc->sc_rio;
+	/* Enforce inflight < cqlen so completion cannot block workers. */
+	if (rio_inflight(sc) >= sc->sc_config.rio_cqlen - 1) {
+		return (NULL);
+	}
 	if (CK_RING_TRYDEQUEUE_MPMC(rio, &rio->rio_submission.rr_ring,
 	    sc->sc_submissions, &slot)) {
 		uint32_t index = slot.rs_index;
 
 		ck_ec_inc(&rio->rio_submission.rr_dqc, &sc->sc_ec_umtx_mode);
-		if (__predict_true(index < sc->sc_ncb)) {
-			counter_u64_add(sc->sc_inflight, 1);
+		if (__predict_true(index < sc->sc_config.rio_ncb)) {
 			*indexp = index;
 			return (&rio->rio_control[index]);
 		}
@@ -358,51 +365,31 @@ rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
 	return (NULL);
 }
 
-static int
-rio_completions_enqueue_pred(const struct ck_ec_wait_state *state,
-    struct timespec *deadline __unused)
+static inline struct riocb *
+rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
 {
-	struct rio_softc *sc = state->data;
+	struct riocb *iocb;
 
-	if (__predict_false(rio_status(sc) != RIO_OPEN)) {
-		return (ECANCELED);
-	}
-	/* TODO: Won't this hang the user process waiting for completions? */
-	if (__predict_false(rio_shuttingdown())) {
-		return (ESHUTDOWN);
-	}
-	return (0);
+	/* The lock prevents inflight counter racing. */
+	mtx_lock(&sc->sc_issuer_lock);
+	iocb = rio_submissions_trydequeue_locked(sc, indexp);
+	mtx_unlock(&sc->sc_issuer_lock);
+	return (iocb);
 }
 
 static inline int
 rio_completions_enqueue(struct rio_softc *sc, uint32_t index)
 {
 	struct rio_slot slot;
-	struct rio *rio;
+	struct rio *rio = sc->sc_rio;
 
 	slot.rs_index = index;
-	rio = sc->sc_rio;
-	for (;;) {
-		uint32_t value;
-		int error;
-
-		value = ck_ec_value(&rio->rio_completion.rr_dqc);
-		if (CK_RING_ENQUEUE_MPMC(rio, &rio->rio_completion.rr_ring,
-		    sc->sc_completions, &slot)) {
-			ck_ec_inc(&rio->rio_completion.rr_nqc,
-			    &sc->sc_ec_umtx_mode);
-			return (0);
-		}
-		/* TODO: deadline from policy? that's a can of worms... */
-		error = ck_ec_wait_pred(&rio->rio_completion.rr_dqc,
-		    &sc->sc_ec_umtx_mode, value, rio_completions_enqueue_pred,
-		    sc, NULL);
-		if (__predict_false(error != 0)) {
-			MPASS(error == ECANCELED || error == ESHUTDOWN);
-			return (error);
-		}
+	if (CK_RING_ENQUEUE_MPMC(rio, &rio->rio_completion.rr_ring,
+	    sc->sc_completions, &slot)) {
+		ck_ec_inc(&rio->rio_completion.rr_nqc, &sc->sc_ec_umtx_mode);
+		return (0);
 	}
-	__unreachable();
+	return (EINVAL);
 }
 
 static void
@@ -421,9 +408,8 @@ rio_destroy_task(void *arg, int pending __unused)
 	 */
 	kva = (vm_offset_t)sc->sc_rio;
 	/* We call shm_map() with an offset of 0, so kva is aligned. */
-	size = round_page(sc->sc_size);
+	size = round_page(rio_config_size(&sc->sc_config));
 	vm_map_remove(kernel_map, kva, kva + size);
-	counter_u64_free(sc->sc_inflight);
 	free(sc->sc_io, M_RIO);
 	rio_close(sc);
 }
@@ -440,19 +426,10 @@ rio_destroy(struct rio_softc *sc)
 		sc->sc_status = RIO_EXITING;
 	}
 	sx_xunlock(&sc->sc_status_lock);
-	if (counter_u64_fetch(sc->sc_inflight) == 0) {
+	if (rio_inflight(sc) == 0) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
-	} else {
-		/*
-		 * Wake all workers waiting to enqueue for completion.  We don't
-		 * actually have to make space in the ring.  Any new attempts to
-		 * enqueue for completion with a full ring will fail the wait
-		 * predicate.
-		 */
-		rio_ec_umtx_wake_n(&sc->sc_ec_umtx_ops,
-		    &sc->sc_rio->rio_completion.rr_dqc.counter, INT_MAX);
-		/* The final completion enqueues the destruction task. */
 	}
+	/* The final completion enqueues the destruction task. */
 }
 
 static inline void
@@ -501,6 +478,7 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	if ((error = rio_open(&sc)) != 0) {
 		return (error);
 	}
+	memcpy(&sc->sc_config, conf, sizeof(*conf));
 	size = rio_config_size(conf);
 	/* TODO: Will mmap enforce size limits for us? */
 	if ((error = shm_map(fp, size, 0, (void **)&sc->sc_rio)) != 0) {
@@ -520,15 +498,13 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	sc->sc_io = mallocarray(conf->rio_ncb, sizeof(*sc->sc_io), M_RIO,
 	    M_WAITOK | M_ZERO);
 	sc->sc_urio = rio_shm_uaddr(sc, shmfd);
-	sc->sc_size = size;
-	sc->sc_ncb = conf->rio_ncb;
-	sc->sc_policy_id = conf->rio_policy_id;
 	TASK_INIT(&sc->sc_destroy_task, 0, rio_destroy_task, sc);
-	sc->sc_inflight = counter_u64_alloc(M_WAITOK);
 	sc->sc_ec_umtx_ops = (struct ck_ec_ops){
 		.gettime = rio_ec_gettime,
+#if 0 /* not yet */
 		.wait32 = rio_ec_umtx_wait,
-		.wake32 = rio_ec_umtx_wake_1,
+#endif
+		.wake32 = rio_ec_umtx_wake,
 		/* TODO: tune/override default options for ABI stability */
 	};
 	sc->sc_ec_umtx_mode = (struct ck_ec_mode){
@@ -554,7 +530,7 @@ rio_submit(struct file *fp, struct thread *td)
 	if (__predict_false(sc->sc_proc != td->td_proc)) {
 		return (EDOOFUS);
 	}
-	schedule = rio_src_policies[sc->sc_policy_id];
+	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
 	return (schedule(sc));
 }
 
@@ -681,19 +657,13 @@ rio_srcio_complete(struct rio_srcio *srcio)
 	iocb->rio_status = kiocb->rio_status;
 	atomic_thread_fence_rel();
 	error = rio_completions_enqueue(sc, index);
-	switch (__builtin_expect(0, error)) {
-	case 0:
-	case ECANCELED:
-	case ESHUTDOWN:
-		break;
-	case -1: /* ETIMEDOUT */
-		/* TODO: handle policy-based timeout somehow? */
-	default:
-		__assert_unreachable();
+	if (__predict_false(error == EINVAL)) {
+		/* The user is misbehaving. */
+		rio_destroy(sc);
 	}
-	counter_u64_add(sc->sc_inflight, -1);
-	if (__predict_false(error != 0) &&
-	    __predict_false(counter_u64_fetch(sc->sc_inflight) == 0)) {
+	MPASS(error == 0);
+	if (__predict_false(rio_status(sc) != RIO_OPEN) &&
+	    __predict_false(rio_inflight(sc) == 0)) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	}
 	uma_zfree(rio_srcio_zone, srcio);
