@@ -1389,6 +1389,7 @@ next:
 			if ((iocb = rio_submissions_trydequeue(sc, &index))
 			    == NULL) {
 				sx_sunlock(&sc->sc_status_lock);
+				uma_zfree(rio_src_zone, src);
 				goto next;
 			}
 			srcio = uma_zalloc(rio_srcio_zone, M_WAITOK);
