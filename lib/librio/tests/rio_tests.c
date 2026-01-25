@@ -170,10 +170,13 @@ ATF_TC_BODY(errors, tc)
 		ATF_CHECK(rio_read(rio, &iocb, NULL) == 0);
 	}
 	ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
-	/* Submit the next batch. */
+	/*
+	 * Submit the next batch.  This succeeds, but we get kicked out of the
+	 * issuer queue because the completion queue is not being drained.
+	 */
 	ATF_CHECK(rio_submit(rio) == 0);
-	/* Now the completion queue is full and worker queues are backing up. */
-	for (int i = 0; i < 2 * (SQLEN - 1); i++) {
+	/* Now the completion queue is full and the issuer stopped issuing. */
+	for (int i = 0; i < CQLEN - 1; i++) {
 		/* Blocking dequeues succeed while completions are available. */
 		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
 		ATF_CHECK_INTEQ(iocb.rio_ident, -1);
@@ -181,6 +184,16 @@ ATF_TC_BODY(errors, tc)
 		ATF_CHECK_INTEQ(iocb.rio_error, EBADF);
 	}
 	/* Non-blocking dequeue fails, nothing left. */
+	ATF_CHECK_ERRNO(ETIMEDOUT, rio_poll(rio, &iocb, &deadline));
+	/* Submit again to issue the remaining submissions. */
+	ATF_CHECK(rio_submit(rio) == 0);
+	for (int i = 0; i < CQLEN - 1; i++) {
+		/* Blocking dequeues succeed while completions are available. */
+		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+		ATF_CHECK_INTEQ(iocb.rio_ident, -1);
+		ATF_CHECK_INTEQ(iocb.rio_status, -1);
+		ATF_CHECK_INTEQ(iocb.rio_error, EBADF);
+	}
 	ATF_CHECK_ERRNO(ETIMEDOUT, rio_poll(rio, &iocb, &deadline));
 
 	rio_destroy(rio);
@@ -222,17 +235,28 @@ ATF_TC_BODY(saturation, tc)
 			ATF_CHECK(rio_fsync(rio, &iocb, NULL) == 0);
 			s++;
 		}
+		/* Submissions full. */
+		ATF_CHECK_ERRNO(ETIMEDOUT, rio_fsync(rio, &iocb, &deadline));
+		/* Can submit, but we're immediately kicked off the issuer. */
 		ATF_CHECK(rio_submit(rio) == 0);
 		/*
-		 * Fill faster than we drain, which the kernel should handle
-		 * (barring policy).  The workers cannot complete, so their
-		 * queues begin growing backlogs while the issuers continue to
-		 * drain submissions.
-		 *
-		 * s - c = # in-flight, we want to block workers with a full
-		 * completion queue (CQLEN - 1).
+		 * The submissions being full is our hint to drain completions.
 		 */
 		while (s - c > CQLEN - 1) {
+			ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
+			ATF_CHECK_INTEQ(iocb.rio_error, 0);
+			c++;
+		}
+		/*
+		 * We were kicked off the issuer for not draining completions
+		 * earlier, so the queue must be resubmit before it starts
+		 * being issued.
+		 */
+		ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
+		ATF_CHECK(rio_submit(rio) == 0);
+		/* We have to keep polling to make progress. */
+		while (s - c > 0) {
 			ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
 			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 			ATF_CHECK_INTEQ(iocb.rio_error, 0);
