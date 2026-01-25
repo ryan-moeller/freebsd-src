@@ -8,12 +8,14 @@ SRCS=	rio.c
 INCS=	librio.h
 #MAN+=	rio.3
 
-CFLAGS+= -I${.CURDIR} \
-	 -I/home/ryan/ck/include \
-	 -I/home/ryan/ck/include/x86_64
+CKTOP=	${SRCTOP}/sys/contrib/ck
 
-# XXX: Temporary workaround while prototyping RIO with CK
-.PATH:	/home/ryan/ck/src
+CFLAGS+= \
+	-I${SRCTOP}/sys \
+	-I${CKTOP}/include \
+	-I${CKTOP}/include/${MACHINE_CPUARCH} \
+
+.PATH:	${CKTOP}/src
 SRCS+=	ck_ec.c
 
 # TODO: manpages

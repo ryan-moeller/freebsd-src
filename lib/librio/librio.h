@@ -15,6 +15,7 @@ typedef struct _rio *rio_t;
 
 __BEGIN_DECLS
 int rio_create(rio_t *, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid);
+/* TODO: something to set up a buffer pool (handle multiple pools) */
 int rio_read(rio_t, const struct riocb *, const struct timespec *);
 int rio_write(rio_t, const struct riocb *, const struct timespec *);
 int rio_readv(rio_t, const struct riocb *, const struct timespec *);

@@ -18,6 +18,7 @@
 #include <ck_ring.h>
 
 #include <librio.h>
+#include <rio/rio_internal.h>
 
 struct _rio {
 	struct rio	*rio_mapped;		/* mapped memory region */

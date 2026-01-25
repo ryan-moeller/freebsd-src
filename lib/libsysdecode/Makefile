@@ -121,11 +121,6 @@ CPP+=	-m32
 CFLAGS+=-DPF
 .endif
 
-# XXX: Temporary workaround while prototyping RIO with CK
-CFLAGS.ioctl.c+=	\
-	-I/home/ryan/ck/include \
-	-I/home/ryan/ck/include/x86_64
-
 # Workaround duplicate declarations in <netinet/ip_compat.h>
 CFLAGS.gcc.ioctl.c+= -Wno-redundant-decls
 
