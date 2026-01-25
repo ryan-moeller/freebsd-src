@@ -49,7 +49,10 @@
 #include <ck_ec.h>
 #include <ck_ring.h>
 
-/* TODO: sysctls/tunables to control taskqueue properties, counters */
+FEATURE(rio, "Ring I/O");
+
+static SYSCTL_NODE(_kern, OID_AUTO, rio, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "Ring IO configuration");
 
 static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 
@@ -62,11 +65,25 @@ static rio_src_scheduler_f *rio_src_policies[] = {
 	[RIO_POLICY_NONE] = &rio_src_scheduler_none,
 };
 
-/* TODO: tunables, tuning */
-static const u_int rio_flow_issuer_threads = 2;
-static const u_int rio_flow_read_workers = 4;
-static const u_int rio_flow_write_workers = 4;
-static const u_int rio_flow_sync_workers = 4;
+static SYSCTL_NODE(_kern_rio, OID_AUTO, flow, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "RIO per-CPU flow configuration");
+
+static u_int rio_flow_issuer_threads = 2;
+SYSCTL_UINT(_kern_rio_flow, OID_AUTO, issuer_threads, CTLFLAG_RDTUN,
+    &rio_flow_issuer_threads, 0, "Max number of issuer threads per CPU flow");
+
+static u_int rio_flow_read_workers = 4;
+SYSCTL_UINT(_kern_rio_flow, OID_AUTO, read_workers, CTLFLAG_RDTUN,
+    &rio_flow_read_workers, 0, "Max number of read workers per CPU flow");
+
+static u_int rio_flow_write_workers = 4;
+SYSCTL_UINT(_kern_rio_flow, OID_AUTO, write_workers, CTLFLAG_RDTUN,
+    &rio_flow_write_workers, 0, "Max number of write workers per CPU flow");
+
+static u_int rio_flow_sync_workers = 4;
+SYSCTL_UINT(_kern_rio_flow, OID_AUTO, sync_workers, CTLFLAG_RDTUN,
+    &rio_flow_sync_workers, 0, "Max number of write workers per CPU flow");
+
 /* TODO: other worker classes */
 
 /* Deferred softc destruction. */
@@ -74,6 +91,9 @@ static struct taskqueue *rio_doom;
 
 /* Shutdown handling. */
 static u_int rio_open_count;
+SYSCTL_UINT(_kern_rio, OID_AUTO, open_count, CTLFLAG_RD, &rio_open_count, 0,
+    "Number of open RIO handles");
+
 static struct mtx rio_shutdown_lock;
 MTX_SYSINIT(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
     MTX_DEF);
@@ -90,6 +110,8 @@ rio_shuttingdown(void)
 
 /* size of riopriv bitset */
 static u_int rio_max_workers = PAGE_SIZE * NBBY;
+SYSCTL_UINT(_kern_rio, OID_AUTO, max_workers, CTLFLAG_RDTUN, &rio_max_workers,
+    0, "Max worker processes (sizes vmspace bitset)");
 
 /* private vmspace RIO context */
 BITSET_DEFINE_VAR(riopriv);
@@ -1315,8 +1337,10 @@ rio_scheduler_destroy(struct rio_scheduler *sched)
 
 /* TODO: remote flow selection process */
 
-/* TODO: tunable, tuning */
-static u_int rio_attention_span = 1024; /* IO batching parameter */
+/* TODO: tuning */
+static u_int rio_attention_span = 1024;
+SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
+    &rio_attention_span, 0, "Single-source I/O batch size");
 
 static void
 rio_issuer_thread(void *arg)
