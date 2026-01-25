@@ -8,6 +8,7 @@
 
 #define EXTERR_CATEGORY EXTERR_CAT_RIO
 #include <sys/param.h>
+#include <sys/bitset.h>
 #include <sys/bitstring.h>
 #include <sys/buf.h>
 #include <sys/condvar.h>
@@ -85,6 +86,42 @@ static inline bool
 rio_shuttingdown(void)
 {
 	return (atomic_load_acq_int(&rio_shutdown_pending));
+}
+
+/* size of riopriv bitset */
+static u_int rio_max_workers = PAGE_SIZE * NBBY;
+
+/* private vmspace RIO context */
+BITSET_DEFINE_VAR(riopriv);
+
+static inline void
+rio_vmspace_init(struct vmspace *vm)
+{
+	struct riopriv *priv;
+
+	if (vm->vm_rio != NULL) {
+		return;
+	}
+	priv = BITSET_ALLOC(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
+	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)priv)) {
+		BITSET_FREE(priv, M_RIO);
+	}
+}
+
+static inline void
+rio_vmspace_switch(struct vmspace *vm, u_int id)
+{
+	struct vmspace *oldvm = curproc->p_vmspace;
+
+	if (vm != oldvm) {
+		if (oldvm->vm_rio != NULL) {
+			BIT_CLR_ATOMIC(rio_max_workers, id, oldvm->vm_rio);
+		}
+		if (vm->vm_rio != NULL) {
+			BIT_SET_ATOMIC(rio_max_workers, id, vm->vm_rio);
+		}
+		vmspace_switch_aio(vm);
+	}
 }
 
 /* kernel-private IO control block */
@@ -440,6 +477,7 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
 	sc->sc_proc = td->td_proc;
 	sc->sc_vmspace = vmspace_acquire_ref(sc->sc_proc);
+	rio_vmspace_init(sc->sc_vmspace);
 	rio = sc->sc_rio;
 	rio_ring_init(&rio->rio_submission, conf->rio_sqlen);
 	rio_ring_init(&rio->rio_completion, conf->rio_cqlen);
@@ -547,6 +585,7 @@ rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
 
 	mtx_lock(&issuer->ri_lock);
 	while (STAILQ_EMPTY(&issuer->ri_srcs)) {
+		/* TODO: timeout for autoscaling */
 		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
 		if (__predict_false(rio_shuttingdown())) {
 			mtx_unlock(&issuer->ri_lock);
@@ -571,7 +610,7 @@ STAILQ_HEAD(rio_srcios, rio_srcio);
 
 static uma_zone_t rio_srcio_zone;
 
-typedef void rio_srcio_handler_f(struct rio_srcio *);
+typedef void rio_srcio_handler_f(struct rio_srcio *, u_int);
 
 static inline uint32_t
 rio_srcio_index(struct rio_srcio *srcio)
@@ -642,14 +681,13 @@ rio_srcio_proc(struct rio_srcio *srcio)
 }
 
 static inline void
-rio_srcio_vmspace_switch(struct rio_srcio *srcio)
+rio_srcio_vmspace_switch(struct rio_srcio *srcio, u_int id)
 {
-	/* We aren't AIO, but close enough. */
-	vmspace_switch_aio(srcio->rs_sc->sc_vmspace);
+	rio_vmspace_switch(srcio->rs_sc->sc_vmspace, id);
 }
 
 static void
-rio_srcio_read(struct rio_srcio *srcio)
+rio_srcio_read(struct rio_srcio *srcio, u_int id)
 {
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
@@ -662,7 +700,7 @@ rio_srcio_read(struct rio_srcio *srcio)
 	ssize_t len;
 	u_int flags;
 
-	rio_srcio_vmspace_switch(srcio);
+	rio_srcio_vmspace_switch(srcio, id);
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
@@ -701,7 +739,7 @@ rio_srcio_read(struct rio_srcio *srcio)
 }
 
 static void
-rio_srcio_write(struct rio_srcio *srcio)
+rio_srcio_write(struct rio_srcio *srcio, u_int id)
 {
 	struct proc *p = rio_srcio_proc(srcio);
 	struct thread *td = curthread;
@@ -715,7 +753,7 @@ rio_srcio_write(struct rio_srcio *srcio)
 	ssize_t len;
 	u_int flags;
 
-	rio_srcio_vmspace_switch(srcio);
+	rio_srcio_vmspace_switch(srcio, id);
 	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
 	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
@@ -762,7 +800,7 @@ rio_srcio_write(struct rio_srcio *srcio)
 }
 
 static void
-rio_srcio_sync(struct rio_srcio *srcio)
+rio_srcio_sync(struct rio_srcio *srcio, u_int id)
 {
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
@@ -775,7 +813,7 @@ rio_srcio_sync(struct rio_srcio *srcio)
 	int error = 0;
 
 	if (cmd == RIO_MLOCK) {
-		rio_srcio_vmspace_switch(srcio);
+		rio_srcio_vmspace_switch(srcio, id);
 		/*
 		 * TODO: After the commands are fleshed out, see if it is
 		 * possible to make ident an int and use the rio_data/rio_buf
@@ -833,6 +871,7 @@ struct rio_worker {
 	struct proc		*rw_hint;	/* last enqueued proc */
 	u_int			rw_len;
 	u_int			rw_cpu;
+	u_int			rw_id;
 	bool			rw_done;
 };
 
@@ -844,10 +883,10 @@ rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 	mtx_lock(&worker->rw_lock);
 	wake = STAILQ_EMPTY(&worker->rw_srcios);
 	STAILQ_INSERT_TAIL(&worker->rw_srcios, srcio, rs_srcios);
+	worker->rw_len++;
 	if (wake) {
 		cv_signal(&worker->rw_cond);
 	}
-	worker->rw_len++;
 	mtx_unlock(&worker->rw_lock);
 }
 
@@ -857,14 +896,20 @@ rio_worker_dequeue(struct rio_worker *worker, struct rio_srcio **srciop)
 	struct rio_srcio *srcio;
 
 	mtx_lock(&worker->rw_lock);
-	while (STAILQ_EMPTY(&worker->rw_srcios)) {
+	if (STAILQ_EMPTY(&worker->rw_srcios)) {
+		/* TODO: timeout for autoscaling */
 		cv_wait(&worker->rw_cond, &worker->rw_lock);
-		if (__predict_false(rio_shuttingdown())) {
-			mtx_unlock(&worker->rw_lock);
-			return (ESHUTDOWN);
-		}
+	}
+	if (__predict_false(rio_shuttingdown())) {
+		mtx_unlock(&worker->rw_lock);
+		return (ESHUTDOWN);
 	}
 	srcio = STAILQ_FIRST(&worker->rw_srcios);
+	if (__predict_false(srcio == NULL)) {
+		/* Signaled to relinquish vmspace. */
+		mtx_unlock(&worker->rw_lock);
+		return (ESRCH);
+	}
 	STAILQ_REMOVE_HEAD(&worker->rw_srcios, rs_srcios);
 	worker->rw_len--;
 	mtx_unlock(&worker->rw_lock);
@@ -904,6 +949,55 @@ rio_flow_classify(struct rio_flow *flow, struct rio_srcio *srcio, u_int *lenp)
 	/* TODO: others */
 	}
 	__assert_unreachable();
+}
+
+static inline struct rio_worker *
+rio_worker_lookup(u_int id)
+{
+	const size_t flow_stride = rio_flow_read_workers +
+	    rio_flow_write_workers + rio_flow_sync_workers;
+	const u_int class_strides[] = {
+		rio_flow_read_workers,
+		rio_flow_write_workers,
+		rio_flow_sync_workers,
+	};
+	/* TODO: more classes? */
+	struct rio_flow *flow = DPCPU_ID_PTR(id / flow_stride, rio_flow);
+	struct rio_worker **classes = &flow->rf_read;
+	u_int idx = id % flow_stride;
+
+	for (u_int class = 0; class < nitems(class_strides); class++) {
+		u_int class_stride = class_strides[class];
+
+		if (idx < class_stride) {
+			return (&classes[class][idx]);
+		}
+		idx -= class_stride;
+	}
+	__assert_unreachable();
+}
+
+void
+rio_vmspace_exit(struct vmspace *vm)
+{
+	struct riopriv *workers = vm->vm_rio;
+	size_t id;
+
+	if (workers == NULL) {
+		return;
+	}
+	/* Signal any sleeping workers using this vmspace. */
+	BIT_FOREACH_ISSET(rio_max_workers, id, workers) {
+		struct rio_worker *worker = rio_worker_lookup(id);
+
+		mtx_lock(&worker->rw_lock);
+		if (worker->rw_len == 0) {
+			cv_signal(&worker->rw_cond);
+		}
+		mtx_unlock(&worker->rw_lock);
+	}
+	BITSET_FREE(workers, M_RIO);
+	vm->vm_rio = NULL;
 }
 
 /* TODO: schedulers deep dive */
@@ -1313,20 +1407,24 @@ static void
 rio_worker_proc(void *arg)
 {
 	struct rio_worker *self = arg;
-	struct vmspace *myvm;
+	struct vmspace *myvm = vmspace_acquire_ref(curproc);
 	struct thread *td = curthread;
+	u_int id = self->rw_id;
 
 	thread_lock(td);
 	sched_bind(td, self->rw_cpu);
 	thread_unlock(td);
-	myvm = vmspace_acquire_ref(curproc);
 	for (;;) {
 		struct rio_srcio *srcio;
+		int error;
 
-		/* TODO: idle timeouts for scaling down? */
-		if (rio_worker_dequeue(self, &srcio) != 0) {
-			/* ESHUTDOWN */
+		if ((error = rio_worker_dequeue(self, &srcio)) == ESHUTDOWN) {
 			break;
+		}
+		if (error == ESRCH) {
+			/* Relinquish vmspace on user process exit. */
+			rio_vmspace_switch(myvm, id);
+			continue;
 		}
 		/* Check for close. */
 		if (__predict_false(rio_doomed(srcio->rs_sc))) {
@@ -1340,22 +1438,11 @@ rio_worker_proc(void *arg)
 		}
 		/* Handle if not already failed by issuer. */
 		if (__predict_true(srcio->rs_io->rio_cb.rio_status != -1)) {
-			self->rw_handler(srcio);
+			self->rw_handler(srcio, id);
 		}
 		rio_srcio_complete(srcio);
-		/*
-		 * TODO: Workers should return to their own vmspace to release
-		 * the user process vmspace when the user process goes away.
-		 * Otherwise we may be holding a large vmspace until another
-		 * srcio gets us to switch.
-		 *
-		 * This could probably be based on either a work dequeue timeout
-		 * or an event handler for process exit that scans all workers.
-		 * The event handler would probably need a lot of machinery.  A
-		 * timeout could actually drive autoscaling worker threads.
-		 */
 	}
-	vmspace_switch_aio(myvm);
+	rio_vmspace_switch(myvm, id);
 	vmspace_free(myvm);
 	mtx_lock(&self->rw_lock);
 	self->rw_done = true;
@@ -1376,7 +1463,7 @@ rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
 	mtx_init(&issuer->ri_lock, "rio issuer lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&issuer->ri_cond, "rio issuer cond");
 	STAILQ_INIT(&issuer->ri_srcs);
-	/* TODO: automatic startup/shutdown (kick taskqueue?) */
+	/* TODO: always initialize context, but add threads on demand */
 	for (u_int i = 0; i < rio_flow_issuer_threads; i++) {
 		/* Spawn issuer threads in the proc0 kernel process. */
 		if ((error = kproc_kthread_add(rio_issuer_thread, issuer,
@@ -1395,15 +1482,18 @@ static inline int
 rio_worker_init(struct rio_worker *worker, rio_srcio_handler_f *handler,
     const char *classname, u_int cpu, u_int i)
 {
+	static u_int nextid;
 	int error;
 
 	worker->rw_handler = handler;
 	worker->rw_cpu = cpu;
+	worker->rw_id = nextid++;
 	worker->rw_done = false;
 	mtx_init(&worker->rw_lock, "rio worker lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&worker->rw_cond, "rio worker cond");
 	STAILQ_INIT(&worker->rw_srcios);
 	/* Spawn each worker as its own kernel process. */
+	/* TODO: always initialize context, but create processes on demand */
 	if ((error = kproc_create(rio_worker_proc, worker, NULL, 0, 0,
 	    "rio/%s %u.%u", classname, cpu, i)) != 0) {
 		/* TODO: error handling */

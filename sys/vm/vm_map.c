@@ -62,6 +62,8 @@
  *	Virtual memory mapping module.
  */
 
+#include "opt_rio.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/elf.h>
@@ -75,6 +77,7 @@
 #include <sys/vnode.h>
 #include <sys/racct.h>
 #include <sys/resourcevar.h>
+#include <sys/rio.h>
 #include <sys/rwlock.h>
 #include <sys/file.h>
 #include <sys/sysctl.h>
@@ -332,6 +335,7 @@ vmspace_alloc(vm_offset_t min, vm_offset_t max, pmap_pinit_t pinit)
 	_vm_map_init(&vm->vm_map, vmspace_pmap(vm), min, max);
 	refcount_init(&vm->vm_refcnt, 1);
 	vm->vm_shm = NULL;
+	vm->vm_rio = NULL;
 	vm->vm_swrss = 0;
 	vm->vm_tsize = 0;
 	vm->vm_dsize = 0;
@@ -416,6 +420,7 @@ vmspace_exit(struct thread *td)
 	p = td->td_proc;
 	vm = p->p_vmspace;
 
+	rio_vmspace_exit(vm);
 	/*
 	 * Prepare to release the vmspace reference.  The thread that releases
 	 * the last reference is responsible for tearing down the vmspace.
