@@ -428,7 +428,7 @@ rio_destroy(struct rio_softc *sc)
 		 * predicate.
 		 */
 		rio_ec_umtx_wake_n(&sc->sc_ec_umtx_ops,
-		    &sc->sc_rio->rio_completion.rr_dqc.counter, UINT_MAX);
+		    &sc->sc_rio->rio_completion.rr_dqc.counter, INT_MAX);
 		/* The final completion enqueues the destruction task. */
 	}
 }
