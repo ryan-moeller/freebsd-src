@@ -147,6 +147,12 @@ rio_io_flags(struct rio_io *io)
 /* list of all handles for debugging, protected by shutdown lock */
 static LIST_HEAD(, rio_softc) rio_handles;
 
+enum rio_status {
+	RIO_OPEN,	/* the handle is open */
+	RIO_CLOSING,	/* the handle is closing */
+	RIO_EXITING,	/* the process is closing */
+};
+
 struct rio_softc {
 	struct rio	*sc_rio;	/* kernel address of SHM object */
 	struct rio_slot *sc_submissions;/* submission queue slots in rio */
@@ -161,8 +167,8 @@ struct rio_softc {
 	u_int		sc_policy_id;	/* scheduling policy */
 	/* TODO: policy metadata */
 	struct task	sc_destroy_task;/* destruction task */
-	boolean_t	sc_doomed;	/* impending doom */
-	struct sx	sc_doom_lock;	/* block doom while issuing */
+	enum rio_status	sc_status;	/* softc/process status */
+	struct sx	sc_status_lock;	/* block status change while issuing */
 	counter_u64_t	sc_inflight;	/* #io issued and not yet completed */
 	/* TODO: flags? more counters? */
 	/*
@@ -187,7 +193,7 @@ rio_open(struct rio_softc **scp)
 		free(sc, M_RIO);
 		return (ESHUTDOWN);
 	}
-	sx_init(&sc->sc_doom_lock, "rio doom lock");
+	sx_init(&sc->sc_status_lock, "rio status lock");
 	LIST_INSERT_HEAD(&rio_handles, sc, sc_handles);
 	rio_open_count++;
 	mtx_unlock(&rio_shutdown_lock);
@@ -205,14 +211,14 @@ rio_close(struct rio_softc *sc)
 		cv_signal(&rio_shutdown_cond);
 	}
 	mtx_unlock(&rio_shutdown_lock);
-	sx_destroy(&sc->sc_doom_lock);
+	sx_destroy(&sc->sc_status_lock);
 	free(sc, M_RIO);
 }
 
-static inline bool
-rio_doomed(struct rio_softc *sc)
+static enum rio_status
+rio_status(struct rio_softc *sc)
 {
-	return (atomic_load_acq_int(&sc->sc_doomed));
+	return (atomic_load_acq_int(&sc->sc_status));
 }
 
 static int
@@ -336,7 +342,7 @@ rio_completions_enqueue_pred(const struct ck_ec_wait_state *state,
 {
 	struct rio_softc *sc = state->data;
 
-	if (__predict_false(rio_doomed(sc))) {
+	if (__predict_false(rio_status(sc) != RIO_OPEN)) {
 		return (ECANCELED);
 	}
 	/* TODO: Won't this hang the user process waiting for completions? */
@@ -400,13 +406,18 @@ rio_destroy_task(void *arg, int pending __unused)
 	rio_close(sc);
 }
 
+/* called by shm_drop on close */
 void
 rio_destroy(struct rio_softc *sc)
 {
-	sx_xlock(&sc->sc_doom_lock);
+	sx_xlock(&sc->sc_status_lock);
 	/* The sx ensures ordering and visibility to atomic readers. */
-	sc->sc_doomed = true;
-	sx_xunlock(&sc->sc_doom_lock);
+	if ((sc->sc_proc->p_flag & P_WEXIT) == 0) {
+		sc->sc_status = RIO_CLOSING;
+	} else {
+		sc->sc_status = RIO_EXITING;
+	}
+	sx_xunlock(&sc->sc_status_lock);
 	if (counter_u64_fetch(sc->sc_inflight) == 0) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	} else {
@@ -1335,9 +1346,9 @@ next:
 		 * The shared lock prevents the SHM file from closing and the
 		 * process exiting while we're using the process's file table.
 		 */
-		sx_slock(&sc->sc_doom_lock);
-		if (__predict_false(sc->sc_doomed)) {
-			sx_sunlock(&sc->sc_doom_lock);
+		sx_slock(&sc->sc_status_lock);
+		if (__predict_false(sc->sc_status != RIO_OPEN)) {
+			sx_sunlock(&sc->sc_status_lock);
 			uma_zfree(rio_src_zone, src);
 			continue;
 		}
@@ -1353,7 +1364,7 @@ next:
 
 			if ((iocb = rio_submissions_trydequeue(sc, &index))
 			    == NULL) {
-				sx_sunlock(&sc->sc_doom_lock);
+				sx_sunlock(&sc->sc_status_lock);
 				goto next;
 			}
 			srcio = uma_zalloc(rio_srcio_zone, M_WAITOK);
@@ -1390,7 +1401,7 @@ next:
 			}
 			rio_scheduler_schedule(&sched, srcio);
 		}
-		sx_sunlock(&sc->sc_doom_lock);
+		sx_sunlock(&sc->sc_status_lock);
 		rio_issuer_enqueue(self, src);
 	}
 	rio_scheduler_destroy(&sched);
@@ -1416,6 +1427,7 @@ rio_worker_proc(void *arg)
 	thread_unlock(td);
 	for (;;) {
 		struct rio_srcio *srcio;
+		enum rio_status status;
 		int error;
 
 		if ((error = rio_worker_dequeue(self, &srcio)) == ESHUTDOWN) {
@@ -1426,8 +1438,23 @@ rio_worker_proc(void *arg)
 			rio_vmspace_switch(myvm, id);
 			continue;
 		}
-		/* Check for close. */
-		if (__predict_false(rio_doomed(srcio->rs_sc))) {
+		/* Check for close/exit. */
+		status = rio_status(srcio->rs_sc);
+		if (__predict_false(status != RIO_OPEN)) {
+			/*
+			 * Check if the user process is exiting.  The above
+			 * ESRCH check is for handling a wakeup when our queue
+			 * was empty.  This check handles the final dequeue when
+			 * the queue was not empty.
+			 *
+			 * There is no need to do this when there is more in the
+			 * queue, because the next thing will switch vmspace for
+			 * us anyway.
+			 */
+			if (STAILQ_EMPTY(&self->rw_srcios) &&
+			    status == RIO_EXITING) {
+				rio_vmspace_switch(myvm, id);
+			}
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
