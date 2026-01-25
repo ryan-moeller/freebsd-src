@@ -56,7 +56,7 @@
 #include <security/audit/audit.h>
 #include <security/audit/audit_private.h>
 
-#include <contrib/ck/include/ck_queue.h>
+#include <ck_queue.h>
 
 /*
  * Hash table functions for the audit event number to event class mask

@@ -84,24 +84,26 @@ SRCS= $(USER_C) $(KERNEL_C) $(ARCH_C)
 WARNS?=	2
 SHLIB_MAJOR= 4
 CSTD=	c99
-CFLAGS+= -DIN_BASE
-CFLAGS+= -I${ZFSTOP}/include
-CFLAGS+= -I${ZFSTOP}/include/os/freebsd
-CFLAGS+= -I${ZFSTOP}/lib/libspl/include
-CFLAGS+= -I${ZFSTOP}/lib/libspl/include/os/freebsd
-CFLAGS+= -I${ZFSTOP}/lib/libshare
-CFLAGS+= -I${ZFSTOP}/lib/libzpool/include
-CFLAGS+= -I${SRCTOP}/sys/contrib/ck/include
-CFLAGS+= -I${SRCTOP}/sys
-CFLAGS+= -I${SRCTOP}/cddl/compat/opensolaris/include
-CFLAGS+= -I${ZFSTOP}/module/icp/include
-CFLAGS+= -include ${ZFSTOP}/include/sys/simd_config.h
-CFLAGS+= -include ${ZFSTOP}/include/os/freebsd/spl/sys/ccompile.h
-CFLAGS+= -DHAVE_ISSETUGID
-CFLAGS+= -DHAVE_EXECVPE
-CFLAGS+= -include ${SRCTOP}/sys/modules/zfs/zfs_config.h
-CFLAGS+= -DSYSCONFDIR=\"/etc\"
-CFLAGS+= -DPKGDATADIR=\"/usr/share/zfs\"
-CFLAGS+= -DZFSEXECDIR=\"${LIBEXECDIR}/zfs\"
+CFLAGS+= \
+	-DIN_BASE \
+	-I${ZFSTOP}/include \
+	-I${ZFSTOP}/include/os/freebsd \
+	-I${ZFSTOP}/lib/libspl/include \
+	-I${ZFSTOP}/lib/libspl/include/os/freebsd \
+	-I${ZFSTOP}/lib/libshare \
+	-I${ZFSTOP}/lib/libzpool/include \
+	-I${SRCTOP}/sys/contrib/ck/include \
+	-I${SRCTOP}/sys/contrib/ck/include/${MACHINE_CPUARCH} \
+	-I${SRCTOP}/sys \
+	-I${SRCTOP}/cddl/compat/opensolaris/include \
+	-I${ZFSTOP}/module/icp/include \
+	-include ${ZFSTOP}/include/sys/simd_config.h \
+	-include ${ZFSTOP}/include/os/freebsd/spl/sys/ccompile.h \
+	-DHAVE_ISSETUGID \
+	-DHAVE_EXECVPE \
+	-include ${SRCTOP}/sys/modules/zfs/zfs_config.h \
+	-DSYSCONFDIR=\"/etc\" \
+	-DPKGDATADIR=\"/usr/share/zfs\" \
+	-DZFSEXECDIR=\"${LIBEXECDIR}/zfs\" \
 
 .include <bsd.lib.mk>

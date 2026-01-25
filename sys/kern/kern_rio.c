@@ -39,6 +39,8 @@
 #include <sys/user.h>
 #include <sys/vnode.h>
 
+#include <rio/rio_internal.h>
+
 #include <vm/pmap.h>
 #include <vm/uma.h>
 #include <vm/vm_extern.h>

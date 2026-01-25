@@ -51,7 +51,6 @@ SRCS+=	opt_ddb.h
 SRCS+=	${LINUXKPI_GENSRCS}
 
 CFLAGS+= ${LINUXKPI_INCLUDES}
-CFLAGS+= -I${SRCTOP}/sys/contrib/ck/include
 
 EXPORT_SYMS=	YES
 

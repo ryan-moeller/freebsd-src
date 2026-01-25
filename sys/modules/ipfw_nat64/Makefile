@@ -7,6 +7,4 @@ SRCS+=	nat64lsn.c nat64lsn_control.c
 SRCS+=	nat64stl.c nat64stl_control.c
 SRCS+=	opt_ipstealth.h
 
-CFLAGS+= -I${SRCTOP}/sys/contrib/ck/include
-
 .include <bsd.kmod.mk>
