@@ -107,7 +107,7 @@ rio_enqueue(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
 	slot.rs_index = iocb - shm->rio_control;
 	for (;;) {
 		value = ck_ec_value(&shm->rio_submission.rr_dqc);
-		if (CK_RING_ENQUEUE_MPMC(rio, &shm->rio_submission.rr_ring,
+		if (CK_RING_ENQUEUE_MPSC(rio, &shm->rio_submission.rr_ring,
 		    rio->rio_submission_slots, &slot)) {
 			ck_ec_inc(&shm->rio_submission.rr_nqc,
 			    &rio_ec_umtx_mode);

@@ -343,7 +343,7 @@ rio_inflight(struct rio_softc *sc)
 }
 
 static inline struct riocb *
-rio_submissions_trydequeue_locked(struct rio_softc *sc, uint32_t *indexp)
+rio_submissions_dequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 {
 	struct rio_slot slot;
 	struct rio *rio = sc->sc_rio;
@@ -352,7 +352,7 @@ rio_submissions_trydequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 	if (rio_inflight(sc) >= sc->sc_config.rio_cqlen - 1) {
 		return (NULL);
 	}
-	if (CK_RING_TRYDEQUEUE_MPMC(rio, &rio->rio_submission.rr_ring,
+	if (CK_RING_DEQUEUE_MPSC(rio, &rio->rio_submission.rr_ring,
 	    sc->sc_submissions, &slot)) {
 		uint32_t index = slot.rs_index;
 
@@ -368,13 +368,13 @@ rio_submissions_trydequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 }
 
 static inline struct riocb *
-rio_submissions_trydequeue(struct rio_softc *sc, uint32_t *indexp)
+rio_submissions_dequeue(struct rio_softc *sc, uint32_t *indexp)
 {
 	struct riocb *iocb;
 
 	/* The lock prevents inflight counter racing. */
 	mtx_lock(&sc->sc_issuer_lock);
-	iocb = rio_submissions_trydequeue_locked(sc, indexp);
+	iocb = rio_submissions_dequeue_locked(sc, indexp);
 	mtx_unlock(&sc->sc_issuer_lock);
 	return (iocb);
 }
@@ -1358,7 +1358,7 @@ next:
 			uint32_t index;
 			int fd, error;
 
-			if ((iocb = rio_submissions_trydequeue(sc, &index))
+			if ((iocb = rio_submissions_dequeue(sc, &index))
 			    == NULL) {
 				sx_sunlock(&sc->sc_status_lock);
 				uma_zfree(rio_src_zone, src);
