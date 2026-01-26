@@ -50,16 +50,16 @@ ATF_TC_BODY(polling, tc)
 	rio_t rio = NULL;
 	int fd;
 
-	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
 
 	/* Write a string to the file. */
 	iocb.rio_ident = fd;
 	iocb.rio_buf = __DECONST(char *, "test");
 	iocb.rio_length = 4;
-	ATF_CHECK(rio_write(rio, &iocb, NULL) == 0);
-	ATF_CHECK(rio_submit(rio) == 0);
-	ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+	ATF_CHECK(rio_write(rio, &iocb, NULL) != -1);
+	ATF_CHECK(rio_submit(rio) != -1);
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 	ATF_CHECK_INTEQ(iocb.rio_cmd, RIO_WRITE);
 	ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 	ATF_CHECK_INTEQ(iocb.rio_status, 4);
@@ -67,16 +67,16 @@ ATF_TC_BODY(polling, tc)
 
 	/* Read back the string we wrote. */
 	iocb.rio_buf = buf;
-	ATF_CHECK(rio_read(rio, &iocb, NULL) == 0);
-	ATF_CHECK(rio_submit(rio) == 0);
-	ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+	ATF_CHECK(rio_read(rio, &iocb, NULL) != -1);
+	ATF_CHECK(rio_submit(rio) != -1);
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 	ATF_CHECK_INTEQ(iocb.rio_cmd, RIO_READ);
 	ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 	ATF_CHECK_INTEQ(iocb.rio_status, 4);
 	ATF_CHECK_INTEQ(iocb.rio_error, 0);
 	ATF_CHECK_STREQ(buf, "test");
 
-	ATF_CHECK(close(fd) == 0);
+	ATF_CHECK(close(fd) != -1);
 	rio_destroy(rio);
 }
 
@@ -102,7 +102,7 @@ ATF_TC_BODY(vectors, tc)
 	rio_t rio = NULL;
 	int fd;
 
-	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
 
 	/* Write strings to the file using an iovec. */
@@ -111,9 +111,9 @@ ATF_TC_BODY(vectors, tc)
 	iocb.rio_ident = fd;
 	iocb.rio_iov = iov;
 	iocb.rio_length = nitems(iov);
-	ATF_CHECK(rio_writev(rio, &iocb, NULL) == 0);
-	ATF_CHECK(rio_submit(rio) == 0);
-	ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+	ATF_CHECK(rio_writev(rio, &iocb, NULL) != -1);
+	ATF_CHECK(rio_submit(rio) != -1);
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 	ATF_CHECK_INTEQ(iocb.rio_cmd, RIO_WRITEV);
 	ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 	ATF_CHECK_INTEQ(iocb.rio_status, 10);
@@ -124,9 +124,9 @@ ATF_TC_BODY(vectors, tc)
 	iov[0].iov_len = sizeof(buf1);
 	iov[1].iov_base = buf2;
 	iov[1].iov_len = sizeof(buf2);
-	ATF_CHECK(rio_readv(rio, &iocb, NULL) == 0);
-	ATF_CHECK(rio_submit(rio) == 0);
-	ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+	ATF_CHECK(rio_readv(rio, &iocb, NULL) != -1);
+	ATF_CHECK(rio_submit(rio) != -1);
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 	ATF_CHECK_INTEQ(iocb.rio_cmd, RIO_READV);
 	ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 	ATF_CHECK_INTEQ(iocb.rio_status, 10);
@@ -134,7 +134,7 @@ ATF_TC_BODY(vectors, tc)
 	ATF_CHECK_STREQ(buf1, "hello");
 	ATF_CHECK_STREQ(buf2, " kyua");
 
-	ATF_CHECK(close(fd) == 0);
+	ATF_CHECK(close(fd) != -1);
 	rio_destroy(rio);
 }
 
@@ -150,7 +150,7 @@ ATF_TC_BODY(errors, tc)
 	struct riocb iocb = {0};
 	rio_t rio = NULL;
 
-	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 
 	/* Try reading an invalid file into an invalid buffer. */
 	iocb.rio_ident = -1;
@@ -159,26 +159,26 @@ ATF_TC_BODY(errors, tc)
 	/* SQLEN - 1 because the ring always has an empty marker slot. */
 	for (int i = 0; i < SQLEN - 1; i++) {
 		/* Non-blocking submissions succeed with space available. */
-		ATF_CHECK(rio_read(rio, &iocb, &deadline) == 0);
+		ATF_CHECK(rio_read(rio, &iocb, &deadline) != -1);
 	}
 	/* Non-blocking submission fails ETIMEDOUT when out of space. */
 	ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
 	/* Now we must submit. */
-	ATF_CHECK(rio_submit(rio) == 0);
+	ATF_CHECK(rio_submit(rio) != -1);
 	for (int i = 0; i < SQLEN - 1; i++) {
 		/* Blocking submissions succeed until full again. */
-		ATF_CHECK(rio_read(rio, &iocb, NULL) == 0);
+		ATF_CHECK(rio_read(rio, &iocb, NULL) != -1);
 	}
 	ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
 	/*
 	 * Submit the next batch.  This succeeds, but we get kicked out of the
 	 * issuer queue because the completion queue is not being drained.
 	 */
-	ATF_CHECK(rio_submit(rio) == 0);
+	ATF_CHECK(rio_submit(rio) != -1);
 	/* Now the completion queue is full and the issuer stopped issuing. */
 	for (int i = 0; i < CQLEN - 1; i++) {
 		/* Blocking dequeues succeed while completions are available. */
-		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+		ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 		ATF_CHECK_INTEQ(iocb.rio_ident, -1);
 		ATF_CHECK_INTEQ(iocb.rio_status, -1);
 		ATF_CHECK_INTEQ(iocb.rio_error, EBADF);
@@ -186,10 +186,10 @@ ATF_TC_BODY(errors, tc)
 	/* Non-blocking dequeue fails, nothing left. */
 	ATF_CHECK_ERRNO(ETIMEDOUT, rio_poll(rio, &iocb, &deadline));
 	/* Submit again to issue the remaining submissions. */
-	ATF_CHECK(rio_submit(rio) == 0);
+	ATF_CHECK(rio_submit(rio) != -1);
 	for (int i = 0; i < CQLEN - 1; i++) {
 		/* Blocking dequeues succeed while completions are available. */
-		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+		ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 		ATF_CHECK_INTEQ(iocb.rio_ident, -1);
 		ATF_CHECK_INTEQ(iocb.rio_status, -1);
 		ATF_CHECK_INTEQ(iocb.rio_error, EBADF);
@@ -213,7 +213,7 @@ ATF_TC_BODY(saturation, tc)
 	rio_t rio = NULL;
 	int fd, s, c;
 
-	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) == 0);
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
 
 	/* Write a string to the file. */
@@ -224,26 +224,26 @@ ATF_TC_BODY(saturation, tc)
 	s = c = 0;
 	while (s < limit) {
 		/* Non-blocking enqueue, submit when full. */
-		while (rio_write(rio, &iocb, &deadline) == 0) {
+		while (rio_write(rio, &iocb, &deadline) != -1) {
 			s++;
 		}
 		ATF_CHECK_INTEQ(ETIMEDOUT, errno);
 		/* Submission queue full. */
-		ATF_CHECK(rio_submit(rio) == 0);
+		ATF_CHECK(rio_submit(rio) != -1);
 		/* Blocking enqueue, submit when full again. */
 		for (int i = 0; i < SQLEN - 1; i++) {
-			ATF_CHECK(rio_fsync(rio, &iocb, NULL) == 0);
+			ATF_CHECK(rio_fsync(rio, &iocb, NULL) != -1);
 			s++;
 		}
 		/* Submissions full. */
 		ATF_CHECK_ERRNO(ETIMEDOUT, rio_fsync(rio, &iocb, &deadline));
 		/* Can submit, but we're immediately kicked off the issuer. */
-		ATF_CHECK(rio_submit(rio) == 0);
+		ATF_CHECK(rio_submit(rio) != -1);
 		/*
 		 * The submissions being full is our hint to drain completions.
 		 */
 		while (s - c > CQLEN - 1) {
-			ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 			ATF_CHECK_INTEQ(iocb.rio_error, 0);
 			c++;
@@ -254,10 +254,10 @@ ATF_TC_BODY(saturation, tc)
 		 * being issued.
 		 */
 		ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
-		ATF_CHECK(rio_submit(rio) == 0);
+		ATF_CHECK(rio_submit(rio) != -1);
 		/* We have to keep polling to make progress. */
 		while (s - c > 0) {
-			ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 			ATF_CHECK_INTEQ(iocb.rio_error, 0);
 			c++;
@@ -265,13 +265,39 @@ ATF_TC_BODY(saturation, tc)
 	}
 	/* Drain remaining completions. */
 	while (s > c) {
-		ATF_CHECK(rio_poll(rio, &iocb, NULL) == 0);
+		ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 		ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 		ATF_CHECK_INTEQ(iocb.rio_error, 0);
 		c++;
 	}
 
-	ATF_CHECK(close(fd) == 0);
+	ATF_CHECK(close(fd) != -1);
+	rio_destroy(rio);
+}
+
+ATF_TC(cancel);
+ATF_TC_HEAD(cancel, tc)
+{
+	atf_tc_set_md_var(tc, "descr", "Tests cancellation");
+}
+
+ATF_TC_BODY(cancel, tc)
+{
+	struct riocb iocb = {0};
+	rio_t rio = NULL;
+	int cookie;
+
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
+
+	/* We're going to mlock NULL... */
+	ATF_CHECK((cookie = rio_mlock(rio, &iocb, NULL)) != -1);
+	/* On second thought, let's not. */
+	ATF_CHECK(rio_cancel(rio, cookie) != -1);
+	/* Have to go through the motions to flush out the iocb. */
+	ATF_CHECK(rio_submit(rio) != -1);
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
+	ATF_CHECK_INTEQ(iocb.rio_error, ECANCELED);
+
 	rio_destroy(rio);
 }
 
@@ -282,5 +308,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, vectors);
 	ATF_TP_ADD_TC(tp, errors);
 	ATF_TP_ADD_TC(tp, saturation);
+	ATF_TP_ADD_TC(tp, cancel);
 	return (atf_no_error());
 }

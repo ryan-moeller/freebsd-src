@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <ck_ec.h>
+#include <ck_pr.h>
 #include <ck_ring.h>
 
 #include <librio.h>
@@ -28,6 +29,7 @@ struct _rio {
 	struct rio_slot *rio_submission_slots;	/* pointer into mapped */
 	struct rio_slot *rio_completion_slots;	/* pointer into mapped */
 	size_t		rio_size;		/* mapped region size */
+	u_int		rio_ncb;		/* number of control block */
 	int		rio_fd;			/* SHM file descriptor */
 };
 
@@ -72,7 +74,7 @@ static const struct ck_ec_mode rio_ec_umtx_mode = {
 
 /* Take a control block from the freelist. */
 static inline struct riocb *
-rio_reserve(rio_t rio, const struct timespec *deadline)
+rio_reserve(rio_t rio, uint32_t *index, const struct timespec *deadline)
 {
 	struct rio_slot slot;
 	struct riocb *iocb;
@@ -85,6 +87,7 @@ rio_reserve(rio_t rio, const struct timespec *deadline)
 		    rio->rio_freelist_slots, &slot)) {
 			iocb = rio->rio_mapped->rio_control + slot.rs_index;
 			memset(iocb, 0, sizeof(*iocb));
+			*index = slot.rs_index;
 			return (iocb);
 		}
 		/* TODO: variation with predicate? How to handle EINTR? */
@@ -139,8 +142,9 @@ rio_start(rio_t rio, const struct riocb *iocb, u_int cmd,
     const struct timespec *deadline)
 {
 	struct riocb *riocb;
+	uint32_t index;
 
-	if ((riocb = rio_reserve(rio, deadline)) == NULL) {
+	if ((riocb = rio_reserve(rio, &index, deadline)) == NULL) {
 		errno = ETIMEDOUT;
 		return (-1);
 	}
@@ -151,7 +155,7 @@ rio_start(rio_t rio, const struct riocb *iocb, u_int cmd,
 		errno = ETIMEDOUT;
 		return (-1);
 	}
-	return (0);
+	return (index);
 }
 
 /* Set up a handle. */
@@ -226,6 +230,7 @@ rio_create(rio_t *riop, u_int sqlen, u_int cqlen, u_int ncb, u_int policyid)
 	rio->rio_submission_slots = rio_submission_slots(p, &conf);
 	rio->rio_completion_slots = rio_completion_slots(p, &conf);
 	rio->rio_size = size;
+	rio->rio_ncb = ncb;
 	rio->rio_fd = fd;
 	*riop = rio;
 	return (0);
@@ -290,6 +295,23 @@ int
 rio_submit(rio_t rio)
 {
 	return (ioctl(rio->rio_fd, FIORIOSUBMIT));
+}
+
+/* Cancel an enqueued control block. */
+int
+rio_cancel(rio_t rio, uint32_t index)
+{
+	struct riocb *riocb;
+
+	if (index >= rio->rio_ncb) {
+		errno = EINVAL;
+		return (-1);
+	}
+	riocb = rio->rio_mapped->rio_control + index;
+	if (ck_pr_cas_int_value(&riocb->rio_error, 0, ECANCELED, &errno)) {
+		return (0);
+	}
+	return (-1);
 }
 
 /* Pull a completed control block off the completion queue. */
