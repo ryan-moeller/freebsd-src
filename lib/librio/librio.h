@@ -26,6 +26,7 @@ int rio_mlock(rio_t, const struct riocb *, const struct timespec *);
 /* TODO: The rest of the IO ops go here. */
 int rio_submit(rio_t);
 int rio_cancel(rio_t, uint32_t);
+int rio_error(rio_t, uint32_t); /* TODO: better name? */
 int rio_poll(rio_t, struct riocb *, const struct timespec *);
 /* TODO: something to discard the rings? Not safe though... */
 void rio_destroy(rio_t);

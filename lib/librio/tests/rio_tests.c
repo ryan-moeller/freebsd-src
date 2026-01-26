@@ -5,6 +5,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -301,6 +302,51 @@ ATF_TC_BODY(cancel, tc)
 	rio_destroy(rio);
 }
 
+ATF_TC(error_status);
+ATF_TC_HEAD(error_status, tc)
+{
+	atf_tc_set_md_var(tc, "descr", "Tests error status changes");
+}
+
+ATF_TC_BODY(error_status, tc)
+{
+	char buf;
+	struct riocb iocb = {0};
+	int sd[2];
+	rio_t rio = NULL;
+	int cookie, error;
+
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
+	ATF_REQUIRE(socketpair(PF_LOCAL, SOCK_STREAM, 0, sd) != -1);
+
+	iocb.rio_ident = sd[0];
+	iocb.rio_buf = &buf;
+	iocb.rio_length = sizeof(buf);
+	ATF_CHECK((cookie = rio_read(rio, &iocb, NULL)) != -1);
+	/* Initially the error stays 0 while sitting in queues. */
+	ATF_CHECK(rio_error(rio, cookie) == 0);
+	ATF_CHECK(rio_submit(rio) != -1);
+	/* The error will still be 0 until a worker is about to do the I/O. */
+	/* XXX: Do not do this in a real program! */
+	while ((error = rio_error(rio, cookie)) == 0);
+	/* Now we're blocked in the kernel reading from the socket. */
+	ATF_CHECK_INTEQ(error, EINPROGRESS);
+	/* Too late to cancel. */
+	ATF_CHECK_ERRNO(EINPROGRESS, rio_cancel(rio, cookie));
+	/* Let it go. */
+	buf = 'R';
+	ATF_CHECK_INTEQ(write(sd[1], &buf, sizeof(buf)), sizeof(buf));
+	ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
+	ATF_CHECK_INTEQ(iocb.rio_ident, sd[0]);
+	ATF_CHECK_INTEQ(iocb.rio_status, sizeof(buf));
+	ATF_CHECK_INTEQ(iocb.rio_error, 0);
+	ATF_CHECK_INTEQ(buf, 'R');
+
+	ATF_CHECK(close(sd[0]) != -1);
+	ATF_CHECK(close(sd[1]) != -1);
+	rio_destroy(rio);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, create_destroy);
@@ -309,5 +355,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, errors);
 	ATF_TP_ADD_TC(tp, saturation);
 	ATF_TP_ADD_TC(tp, cancel);
+	ATF_TP_ADD_TC(tp, error_status);
 	return (atf_no_error());
 }

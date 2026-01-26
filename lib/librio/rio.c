@@ -314,6 +314,19 @@ rio_cancel(rio_t rio, uint32_t index)
 	return (-1);
 }
 
+/* Check the error status of a control block. */
+int
+rio_error(rio_t rio, uint32_t index)
+{
+	struct riocb *riocb;
+
+	if (index >= rio->rio_ncb) {
+		return (EINVAL);
+	}
+	riocb = rio->rio_mapped->rio_control + index;
+	return (ck_pr_load_int(&riocb->rio_error));
+}
+
 /* Pull a completed control block off the completion queue. */
 int
 rio_poll(rio_t rio, struct riocb *iocb, const struct timespec *deadline)
