@@ -629,14 +629,13 @@ rio_srcio_index(struct rio_srcio *srcio)
 	return (srcio->rs_io - srcio->rs_sc->sc_io);
 }
 
-static inline bool
-rio_srcio_canceled(struct rio_srcio *srcio)
+static inline struct riocb *
+rio_srcio_iocb(struct rio_srcio *srcio)
 {
 	struct rio *rio = srcio->rs_sc->sc_rio;
 	uint32_t index = rio_srcio_index(srcio);
 
-	return (srcio->rs_io->rio_cb.rio_error == ECANCELED ||
-	    atomic_load_int(&rio->rio_control[index].rio_error) == ECANCELED);
+	return (rio->rio_control + index);
 }
 
 static inline void
@@ -644,17 +643,15 @@ rio_srcio_complete(struct rio_srcio *srcio)
 {
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb, *iocb;
-	uint32_t index;
+	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *iocb = rio_srcio_iocb(srcio);
+	uint32_t index = rio_srcio_index(srcio);
 	int error;
 
 	/* Must release resources before io can be reused. */
 	if (io->rio_fd_file != NULL) {
 		fdrop(io->rio_fd_file, NULL);
 	}
-	index = rio_srcio_index(srcio);
-	kiocb = &io->rio_cb;
-	iocb = &sc->sc_rio->rio_control[index];
 	iocb->rio_error = kiocb->rio_error;
 	iocb->rio_status = kiocb->rio_status;
 	atomic_thread_fence_rel();
@@ -1314,6 +1311,12 @@ static u_int rio_attention_span = 1024;
 SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
     &rio_attention_span, 0, "Single-source I/O batch size");
 
+static inline bool
+riocb_canceled(struct riocb *iocb)
+{
+	return (atomic_load_int(&iocb->rio_error) == ECANCELED);
+}
+
 static void
 rio_issuer_thread(void *arg)
 {
@@ -1368,6 +1371,11 @@ next:
 			srcio->rs_sc = sc;
 			srcio->rs_io = io = sc->sc_io + index;
 			memcpy(&io->rio_cb, iocb, sizeof(*iocb));
+			/* Check if canceled while in queue. */
+			if (__predict_false(riocb_canceled(iocb))) {
+				rio_srcio_error(srcio, ECANCELED);
+				continue;
+			}
 			fd = io->rio_cb.rio_ident;
 			switch (rio_io_cmd(io)) {
 			case RIO_NOP:
@@ -1424,6 +1432,7 @@ rio_worker_proc(void *arg)
 	thread_unlock(td);
 	for (;;) {
 		struct rio_srcio *srcio;
+		struct riocb *iocb;
 		enum rio_status status;
 		int error;
 
@@ -1455,15 +1464,14 @@ rio_worker_proc(void *arg)
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
-		/* Check for cancellation. */
-		if (__predict_false(rio_srcio_canceled(srcio))) {
+		/* Check if canceled while in queue. */
+		iocb = rio_srcio_iocb(srcio);
+		if (__predict_false(riocb_canceled(iocb))) {
 			rio_srcio_error(srcio, ECANCELED);
 			continue;
 		}
-		/* Handle if not already failed by issuer. */
-		if (__predict_true(srcio->rs_io->rio_cb.rio_status != -1)) {
-			self->rw_handler(srcio, id);
-		}
+		atomic_store_int(&iocb->rio_error, EINPROGRESS);
+		self->rw_handler(srcio, id);
 		rio_srcio_complete(srcio);
 	}
 	rio_vmspace_switch(myvm, id);
