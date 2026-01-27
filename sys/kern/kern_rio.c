@@ -8,10 +8,13 @@
 
 #define EXTERR_CATEGORY EXTERR_CAT_RIO
 #include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/bio.h>
 #include <sys/bitset.h>
 #include <sys/bitstring.h>
 #include <sys/buf.h>
 #include <sys/condvar.h>
+#include <sys/conf.h>
 #include <sys/counter.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
@@ -31,13 +34,14 @@
 #include <sys/sx.h>
 #include <sys/syscallsubr.h>
 #include <sys/sysctl.h>
-#include <sys/systm.h>
 #include <sys/taskqueue.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/umtxvar.h>
 #include <sys/user.h>
 #include <sys/vnode.h>
+
+#include <geom/geom.h>
 
 #include <rio/rio_internal.h>
 
@@ -46,6 +50,7 @@
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
+#include <vm/vm_page.h>
 #include <vm/vnode_pager.h>
 
 #include <ck_ec.h>
@@ -682,6 +687,227 @@ rio_srcio_error(struct rio_srcio *srcio, int error)
 	kiocb->rio_error = error;
 	kiocb->rio_status = -1;
 	rio_srcio_complete(srcio);
+}
+
+static inline int
+rio_bio_bufsetup(struct bio *bp, struct cdev *dev, vm_map_t map, void *buf,
+    size_t len)
+{
+	struct buf *pbuf;
+	vm_page_t *pages;
+	vm_offset_t addr = (vm_offset_t)buf;
+	vm_offset_t pgoff = addr & PAGE_MASK;
+	vm_prot_t prot;
+	int npages;
+
+	bp->bio_dev = dev;
+	bp->bio_length = len;
+	bp->bio_bcount = len;
+	if ((dev->si_flags & SI_UNMAPPED) != 0 && unmapped_buf_allowed) {
+		pbuf = NULL;
+		pages = mallocarray(atop(round_page(len)) + 1, sizeof(*pages),
+		    M_TEMP, M_WAITOK | M_ZERO);
+	} else {
+		pbuf = uma_zalloc(pbuf_zone, M_WAITOK);
+		BUF_KERNPROC(pbuf);
+		pages = pbuf->b_pages;
+	}
+	prot = VM_PROT_READ | (bp->bio_cmd == BIO_READ ? VM_PROT_WRITE : 0);
+	npages = vm_fault_quick_hold_pages(map, addr, len, prot, pages,
+	    atop(maxphys) + 1);
+	if (npages == -1) {
+		if (pbuf == NULL) {
+			free(pages, M_TEMP);
+		} else {
+			uma_zfree(pbuf_zone, pbuf);
+		}
+		return (EFAULT);
+	}
+	if (pbuf == NULL) {
+		bp->bio_ma = pages;
+		bp->bio_ma_n = npages;
+		bp->bio_ma_offset = pgoff;
+		bp->bio_data = unmapped_buf;
+		bp->bio_flags = BIO_UNMAPPED;
+		/* TODO: accounting a la aio num_unmapped_aio */
+	} else {
+		pmap_qenter((vm_offset_t)pbuf->b_data, pages, npages);
+		bp->bio_data = pbuf->b_data + pgoff;
+		bp->bio_caller2 = pbuf;
+		pbuf->b_npages = npages;
+		/* TODO: accounting a la aio num_buf_aio */
+	}
+	return (0);
+}
+
+static inline void
+rio_bio_destroy(struct bio *bp)
+{
+	vm_page_t *pages = bp->bio_ma;
+	struct buf *pbuf = bp->bio_caller2;
+
+	if (pbuf != NULL) {
+		int npages = pbuf->b_npages;
+
+		MPASS(npages <= atop(maxphys) + 1);
+		pmap_qremove((vm_offset_t)pbuf->b_data, npages);
+		vm_page_unhold_pages(pbuf->b_pages, npages);
+		uma_zfree(pbuf_zone, pbuf);
+		/* TODO: accounting a la aio num_buf_aio */
+	} else if (pages != NULL) {
+		int npages = bp->bio_ma_n;
+
+		MPASS(npages <= atop(maxphys) + 1);
+		vm_page_unhold_pages(pages, npages);
+		free(pages, M_TEMP);
+		/* TODO: accounting a la aio num_unmapped_aio */
+	}
+	g_destroy_bio(bp);
+}
+
+static void
+rio_bio_childdone(struct bio *bp)
+{
+	struct bio *pbp = bp->bio_parent;
+	u_int inbed;
+
+	/*
+	 * First to error wins.  See sys/geom/notes.
+	 */
+	if (__predict_false(bp->bio_error != 0)) {
+		atomic_cmpset_int(&pbp->bio_error, 0, bp->bio_error);
+	}
+	atomic_add_64(&pbp->bio_completed, bp->bio_completed);
+	rio_bio_destroy(bp);
+	inbed = atomic_fetchadd_int(&pbp->bio_inbed, 1) + 1;
+	if (pbp->bio_children == inbed) {
+		pbp->bio_done(pbp);
+	}
+}
+
+static void
+rio_bio_complete(struct bio *bp)
+{
+	struct rio_srcio *srcio = bp->bio_caller1;
+	struct riocb *kiocb = rio_io_kiocb(srcio->rs_io);
+
+	kiocb->rio_status = bp->bio_completed;
+	kiocb->rio_error = bp->bio_error;
+	rio_bio_destroy(bp);
+	rio_srcio_complete(srcio);
+}
+
+static inline int
+rio_srcio_bio_strategy(struct rio_srcio *srcio)
+{
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = rio_io_kiocb(io);
+	vm_map_t map = &srcio->rs_sc->sc_vmspace->vm_map;
+	struct file *fp = io->rio_fd_file;
+	struct vnode *vp = fp->f_vnode;
+	struct cdevsw *csw;
+	struct cdev *dev;
+	struct bio *pbp;
+	off_t offset = kiocb->rio_offset;
+	size_t resid;
+	u_int cmd = rio_io_cmd(io);
+	u_int flags = rio_io_flags(io);
+	int bsize, bio_cmd, error, ref = 0;
+	bool vectored = (flags & RIO_VECTORED) != 0;
+
+	switch (cmd) {
+	case RIO_READ:
+		bio_cmd = BIO_READ;
+		break;
+	case RIO_WRITE:
+		bio_cmd = BIO_WRITE;
+		break;
+	/* TODO: BIO_DELETE? BIO_FLUSH? */
+	default:
+		return (EINVAL);
+	}
+	if (fp == NULL || fp->f_type != DTYPE_VNODE) {
+		return (EINVAL);
+	}
+	if (vp->v_type != VCHR || (bsize = vp->v_bufobj.bo_bsize) == 0) {
+		return (EINVAL);
+	}
+	/* TODO: limits a la max_buf_aio et cetera */
+	if (vectored) {
+		resid = 0;
+		for (int i = 0; i < kiocb->rio_length; i++) {
+			size_t len = kiocb->rio_iov[i].iov_len;
+
+			if (len % bsize != 0 || len > maxphys) {
+				return (EINVAL);
+			}
+			resid += len;
+		}
+	} else {
+		resid = kiocb->rio_length;
+		if (resid % bsize != 0 || resid > maxphys) {
+			return (EINVAL);
+		}
+	}
+	if ((csw = devvn_refthread(vp, &dev, &ref)) == NULL) {
+		return (ENXIO);
+	}
+	if ((csw->d_flags & D_DISK) == 0) {
+		error = EINVAL;
+		goto unref;
+	}
+	if (resid > dev->si_iosize_max) {
+		error = EINVAL;
+		goto unref;
+	}
+	/* TODO: buffer count limits a la aio */
+	pbp = g_alloc_bio();
+	pbp->bio_cmd = bio_cmd;
+	pbp->bio_offset = offset;
+	pbp->bio_length = resid;
+	pbp->bio_caller1 = srcio;
+	pbp->bio_done = rio_bio_complete;
+	if (vectored) {
+		size_t nchildren = kiocb->rio_length;
+		struct bio **children;
+
+		children = mallocarray(nchildren, sizeof(*children), M_TEMP,
+		    M_WAITOK | M_ZERO);
+		for (int i = 0; i < nchildren; i++) {
+			struct iovec *iov = kiocb->rio_iov + i;
+			struct bio *bp = g_duplicate_bio(pbp);
+
+			children[i] = bp;
+			bp->bio_offset = offset;
+			bp->bio_done = rio_bio_childdone;
+			if ((error = rio_bio_bufsetup(bp, dev, map,
+			    iov->iov_base, iov->iov_len)) != 0) {
+				do {
+					rio_bio_destroy(children[i]);
+				} while (i-- > 0);
+				free(children, M_TEMP);
+				goto destroy;
+			}
+			offset += iov->iov_len;
+		}
+		for (int i = 0; i < nchildren; i++) {
+			csw->d_strategy(children[i]);
+		}
+		free(children, M_TEMP);
+	} else {
+		if ((error = rio_bio_bufsetup(pbp, dev, map, kiocb->rio_buf,
+		    kiocb->rio_length)) != 0) {
+			goto destroy;
+		}
+		csw->d_strategy(pbp);
+	}
+	dev_relthread(dev, ref);
+	return (0);
+destroy:
+	g_destroy_bio(pbp);
+unref:
+	dev_relthread(dev, ref);
+	return (error);
 }
 
 static inline struct proc *
@@ -1406,6 +1632,16 @@ next:
 			if (__predict_false(error != 0)) {
 				rio_srcio_error(srcio, error);
 				continue;
+			}
+			/* Try the async BIO strategy if available. */
+			switch (rio_srcio_bio_strategy(srcio)) {
+			case 0:
+				continue;
+			case ENXIO:
+				rio_srcio_error(srcio, ENXIO);
+				continue;
+			default:
+				break;
 			}
 			rio_scheduler_schedule(&sched, srcio);
 		}
