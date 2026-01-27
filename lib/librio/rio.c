@@ -21,6 +21,8 @@
 #include <librio.h>
 #include <rio/rio_internal.h>
 
+#define USER_CMD_FLAGS	(RIO_FOFFSET)
+
 struct _rio {
 	struct rio	*rio_mapped;		/* mapped memory region */
 	ck_ring_t	rio_freelist;		/* control blocks freelist */
@@ -149,7 +151,8 @@ rio_start(rio_t rio, const struct riocb *iocb, u_int cmd,
 		return (-1);
 	}
 	memcpy(riocb, iocb, sizeof(*iocb));
-	riocb->rio_cmd = cmd;
+	riocb->rio_cmd &= USER_CMD_FLAGS;
+	riocb->rio_cmd |= cmd;
 	if (rio_enqueue(rio, riocb, deadline) == -1) {
 		rio_return(rio, riocb);
 		errno = ETIMEDOUT;
