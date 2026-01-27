@@ -1402,7 +1402,7 @@ next:
 			}
 			if (__predict_false(error != 0)) {
 				rio_srcio_error(srcio, error);
-				break;
+				continue;
 			}
 			rio_scheduler_schedule(&sched, srcio);
 		}
