@@ -688,6 +688,40 @@ rio_srcio_vmspace_switch(struct rio_srcio *srcio, u_int id)
 	rio_vmspace_switch(srcio->rs_sc->sc_vmspace, id);
 }
 
+static inline ssize_t
+rio_srcio_rw_common(struct rio_srcio *srcio, struct uio *uio, struct iovec *iov,
+    int *flagsp, u_int id)
+{
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = &io->rio_cb;
+	size_t len;
+	u_int flags;
+
+	rio_srcio_vmspace_switch(srcio, id);
+	/* TODO: special handling for devices/sockets */
+	/* TODO: put this all in a kaiocb for socket fo_aio_queue? */
+	uio->uio_td = curthread;
+	uio->uio_segflg = UIO_USERSPACE;
+	uio->uio_offset = kiocb->rio_offset;
+	flags = rio_io_flags(io);
+	if ((flags & RIO_VECTORED) == 0) {
+		iov->iov_base = kiocb->rio_buf;
+		iov->iov_len = kiocb->rio_length;
+		uio->uio_iov = iov;
+		uio->uio_iovcnt = 1;
+	} else {
+		uio->uio_iov = kiocb->rio_iov;
+		uio->uio_iovcnt = kiocb->rio_length;
+	}
+	len = 0;
+	for (int i = 0; i < uio->uio_iovcnt; i++) {
+		len += uio->uio_iov[i].iov_len;
+	}
+	uio->uio_resid = len;
+	*flagsp = (flags & RIO_FOFFSET) == 0 ? FOF_OFFSET : 0;
+	return (len);
+}
+
 static void
 rio_srcio_read(struct rio_srcio *srcio, u_int id)
 {
@@ -700,33 +734,13 @@ rio_srcio_read(struct rio_srcio *srcio, u_int id)
 	struct iovec iov;
 	struct uio uio;
 	ssize_t len;
-	u_int flags;
+	int flags;
 
-	rio_srcio_vmspace_switch(srcio, id);
-	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
-	uio.uio_td = td;
-	uio.uio_segflg = UIO_USERSPACE;
+	len = rio_srcio_rw_common(srcio, &uio, &iov, &flags, id);
 	uio.uio_rw = UIO_READ;
-	uio.uio_offset = kiocb->rio_offset;
-	flags = rio_io_flags(io);
-	if ((flags & RIO_VECTORED) == 0) {
-		iov.iov_base = kiocb->rio_buf;
-		iov.iov_len = kiocb->rio_length;
-		uio.uio_iov = &iov;
-		uio.uio_iovcnt = 1;
-	} else {
-		uio.uio_iov = kiocb->rio_iov;
-		uio.uio_iovcnt = kiocb->rio_length;
-	}
-	len = 0;
-	for (int i = 0; i < uio.uio_iovcnt; i++) {
-		len += uio.uio_iov[i].iov_len;
-	}
-	uio.uio_resid = len;
-	switch ((kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred,
-	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
+	kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred, flags, td);
+	switch (kiocb->rio_error) {
 	case 0:
 	case ERESTART:
 	case EINTR:
@@ -753,36 +767,16 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 	struct iovec iov;
 	struct uio uio;
 	ssize_t len;
-	u_int flags;
+	int flags;
 
-	rio_srcio_vmspace_switch(srcio, id);
-	/* TODO: special handling for devices/sockets */
 	td->td_ucred = sc->sc_cred;
-	/* TODO: put this all in a kaiocb for socket fo_aio_queue */
-	uio.uio_td = td;
-	uio.uio_segflg = UIO_USERSPACE;
+	len = rio_srcio_rw_common(srcio, &uio, &iov, &flags, id);
 	uio.uio_rw = UIO_WRITE;
-	uio.uio_offset = kiocb->rio_offset;
-	flags = rio_io_flags(io);
-	if ((flags & RIO_VECTORED) == 0) {
-		iov.iov_base = kiocb->rio_buf;
-		iov.iov_len = kiocb->rio_length;
-		uio.uio_iov = &iov;
-		uio.uio_iovcnt = 1;
-	} else {
-		uio.uio_iov = kiocb->rio_iov;
-		uio.uio_iovcnt = kiocb->rio_length;
-	}
-	len = 0;
-	for (int i = 0; i < uio.uio_iovcnt; i++) {
-		len += uio.uio_iov[i].iov_len;
-	}
-	uio.uio_resid = len;
 	if (fp->f_type == DTYPE_VNODE) {
 		bwillwrite();
 	}
-	switch ((kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred,
-	    (flags & RIO_FOFFSET) != 0 ? 0 : FOF_OFFSET, td))) {
+	kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred, flags, td);
+	switch (kiocb->rio_error) {
 	case EPIPE:
 		PROC_LOCK(p);
 		kern_psignal(p, SIGPIPE);
