@@ -168,6 +168,12 @@ rio_io_flags(struct rio_io *io)
 	return (io->rio_cb.rio_cmd & RIO_CMD_FLAGS);
 }
 
+static inline struct riocb *
+rio_io_kiocb(struct rio_io *io)
+{
+	return (&io->rio_cb);
+}
+
 /* list of all handles for debugging, protected by shutdown lock */
 static LIST_HEAD(, rio_softc) rio_handles;
 
@@ -643,7 +649,7 @@ rio_srcio_complete(struct rio_srcio *srcio)
 {
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *kiocb = rio_io_kiocb(io);
 	struct riocb *iocb = rio_srcio_iocb(srcio);
 	uint32_t index = rio_srcio_index(srcio);
 	int error;
@@ -671,8 +677,10 @@ rio_srcio_complete(struct rio_srcio *srcio)
 static inline void
 rio_srcio_error(struct rio_srcio *srcio, int error)
 {
-	srcio->rs_io->rio_cb.rio_error = error;
-	srcio->rs_io->rio_cb.rio_status = -1;
+	struct riocb *kiocb = rio_io_kiocb(srcio->rs_io);
+
+	kiocb->rio_error = error;
+	kiocb->rio_status = -1;
 	rio_srcio_complete(srcio);
 }
 
@@ -693,7 +701,7 @@ rio_srcio_rw_common(struct rio_srcio *srcio, struct uio *uio, struct iovec *iov,
     int *flagsp, u_int id)
 {
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *kiocb = rio_io_kiocb(io);
 	size_t len;
 	u_int flags;
 
@@ -729,7 +737,7 @@ rio_srcio_read(struct rio_srcio *srcio, u_int id)
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *kiocb = rio_io_kiocb(io);
 	struct file *fp = io->rio_fd_file;
 	struct iovec iov;
 	struct uio uio;
@@ -762,7 +770,7 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *kiocb = rio_io_kiocb(io);
 	struct file *fp = io->rio_fd_file;
 	struct iovec iov;
 	struct uio uio;
@@ -802,7 +810,7 @@ rio_srcio_sync(struct rio_srcio *srcio, u_int id)
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
-	struct riocb *kiocb = &io->rio_cb;
+	struct riocb *kiocb = rio_io_kiocb(io);
 	struct file *fp = io->rio_fd_file;
 	struct vnode *vp;
 	u_int cmd = rio_io_cmd(io);
@@ -1351,7 +1359,7 @@ next:
 		for (issued = 0; issued < rio_attention_span; issued++) {
 			struct rio_srcio *srcio;
 			struct rio_io *io;
-			struct riocb *iocb;
+			struct riocb *iocb, *kiocb;
 			uint32_t index;
 			int fd, error;
 
@@ -1364,13 +1372,14 @@ next:
 			srcio = uma_zalloc(rio_srcio_zone, M_WAITOK);
 			srcio->rs_sc = sc;
 			srcio->rs_io = io = sc->sc_io + index;
-			memcpy(&io->rio_cb, iocb, sizeof(*iocb));
+			kiocb = rio_io_kiocb(io);
+			memcpy(kiocb, iocb, sizeof(*iocb));
 			/* Check if canceled while in queue. */
 			if (__predict_false(riocb_canceled(iocb))) {
 				rio_srcio_error(srcio, ECANCELED);
 				continue;
 			}
-			fd = io->rio_cb.rio_ident;
+			fd = kiocb->rio_ident;
 			switch (rio_io_cmd(io)) {
 			case RIO_NOP:
 			case RIO_MLOCK:
