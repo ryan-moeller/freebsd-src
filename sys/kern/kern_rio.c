@@ -1415,10 +1415,8 @@ static inline struct rio_worker *
 rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
 {
 	struct rio_selector *sel = &sched->rs_sel;
-	u_int stop = sel->rs_n - 1;
 	u_int count, idx;
 
-	bit_nclear(sel->rs_candidates, 0, stop);
 	bit_and(sel->rs_empty, sel->rs_affine, sel->rs_candidates, sel->rs_n);
 	count = 0;
 	bit_foreach(sel->rs_candidates, sel->rs_n, idx) {
