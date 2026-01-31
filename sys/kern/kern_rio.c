@@ -1843,19 +1843,12 @@ rio_load(void)
 static inline void
 rio_issuer_destroy(struct rio_issuer *issuer)
 {
-	struct rio_src *src1, *src2;
-
 	mtx_lock(&issuer->ri_lock);
 	cv_broadcast(&issuer->ri_cond);
 	while (issuer->ri_threads > 0) {
 		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
 	}
-	src1 = STAILQ_FIRST(&issuer->ri_srcs);
-	while (src1 != NULL) {
-		src2 = STAILQ_NEXT(src1, rs_srcs);
-		uma_zfree(rio_src_zone, src1);
-		src1 = src2;
-	}
+	MPASS(STAILQ_EMPTY(&issuer->ri_srcs));
 	mtx_unlock(&issuer->ri_lock);
 	mtx_destroy(&issuer->ri_lock);
 	cv_destroy(&issuer->ri_cond);
@@ -1864,19 +1857,12 @@ rio_issuer_destroy(struct rio_issuer *issuer)
 static inline void
 rio_worker_destroy(struct rio_worker *worker)
 {
-	struct rio_srcio *srcio1, *srcio2;
-
 	mtx_lock(&worker->rw_lock);
 	cv_signal(&worker->rw_cond);
 	while (!worker->rw_done) {
 		cv_wait(&worker->rw_cond, &worker->rw_lock);
 	}
-	srcio1 = STAILQ_FIRST(&worker->rw_srcios);
-	while (srcio1 != NULL) {
-		srcio2 = STAILQ_NEXT(srcio1, rs_srcios);
-		uma_zfree(rio_srcio_zone, srcio1);
-		srcio1 = srcio2;
-	}
+	MPASS(STAILQ_EMPTY(&worker->rw_srcios));
 	mtx_unlock(&worker->rw_lock);
 	mtx_destroy(&worker->rw_lock);
 	cv_destroy(&worker->rw_cond);
