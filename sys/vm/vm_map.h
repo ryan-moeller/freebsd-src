@@ -298,7 +298,7 @@ vm_map_is_system(vm_map_t map)
 struct vmspace {
 	struct vm_map vm_map;	/* VM address map */
 	struct shmmap_state *vm_shm;	/* SYS5 shared memory private data XXX */
-	struct riopriv *vm_rio;	/* RIO private data XXX */
+	struct rio_worker_affinity *vm_rio;	/* RIO private data XXX */
 	segsz_t vm_swrss;	/* resident set size before last swap */
 	segsz_t vm_tsize;	/* text size (pages) XXX */
 	segsz_t vm_dsize;	/* data size (pages) XXX */
