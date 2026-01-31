@@ -580,7 +580,7 @@ struct rio_issuer {
 	struct cv		ri_cond;
 	struct rio_srcs		ri_srcs;
 	u_int			ri_len;
-	int			ri_seq;	/* for reducing bias */
+	int			ri_phase;	/* for reducing bias */
 	u_int			ri_cpu;
 	u_int			ri_threads;
 };
@@ -617,7 +617,7 @@ rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
 	src = STAILQ_FIRST(&issuer->ri_srcs);
 	STAILQ_REMOVE_HEAD(&issuer->ri_srcs, rs_srcs);
 	issuer->ri_len--;
-	issuer->ri_seq++;
+	issuer->ri_phase++;
 	mtx_unlock(&issuer->ri_lock);
 	*srcp = src;
 	return (0);
@@ -1250,7 +1250,7 @@ rio_src_scheduler_none(struct rio_softc *sc)
 }
 
 /*
- * The selector picks a candidate given a criteria and a sequence number.
+ * The selector picks a candidate given a criteria and a phase offset.
  * It is used to select a worker that should minimize request latency.
  */
 struct rio_selector {
@@ -1384,13 +1384,13 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
  */
 struct rio_scheduler {
 	struct rio_selector	rs_sel;
-	int	*rs_seq;	/* XXX: stale reads should be good enough */
+	int	*rs_phase;	/* XXX: stale reads should be good enough */
 };
 
 static inline void
 rio_scheduler_init(struct rio_scheduler *sched, struct rio_issuer *issuer)
 {
-	sched->rs_seq = &issuer->ri_seq;
+	sched->rs_phase = &issuer->ri_phase;
 	rio_selector_init(&sched->rs_sel, UIMAX(rio_flow_read_workers,
 	    rio_flow_write_workers, rio_flow_sync_workers));
 	/* TODO: more worker classes? */
@@ -1427,7 +1427,7 @@ rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_seq % count]);
+	return (workers + sel->rs_indices[*sched->rs_phase % count]);
 }
 
 static inline struct rio_worker *
@@ -1443,7 +1443,7 @@ rio_scheduler_empty(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_seq % count]);
+	return (workers + sel->rs_indices[*sched->rs_phase % count]);
 }
 
 static inline struct rio_worker *
@@ -1474,7 +1474,7 @@ rio_scheduler_affine(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_seq % count]);
+	return (workers + sel->rs_indices[*sched->rs_phase % count]);
 }
 
 static inline struct rio_worker *
@@ -1489,7 +1489,7 @@ rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
 		sel->rs_indices[count++] = idx;
 	}
 	MPASS(count > 0);
-	return (workers + sel->rs_indices[*sched->rs_seq % count]);
+	return (workers + sel->rs_indices[*sched->rs_phase % count]);
 }
 
 /* Try selecting the least-busy affine worker. */
