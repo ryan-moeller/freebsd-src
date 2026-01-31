@@ -34,7 +34,6 @@
 #include "opt_param.h"
 
 #include <sys/param.h>
-#include <sys/aio.h> /* for aio_swake proto */
 #include <sys/kernel.h>
 #include <sys/ktls.h>
 #include <sys/lock.h>
@@ -52,12 +51,6 @@
 #include <sys/sysctl.h>
 
 #include <netinet/in.h>
-
-/*
- * Function pointer set by the AIO routines so that the socket buffer code
- * can call back into the AIO module if it is loaded.
- */
-void	(*aio_swake)(struct socket *, struct sockbuf *);
 
 /*
  * Primitive routines for operating on socket buffers
