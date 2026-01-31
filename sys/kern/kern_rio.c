@@ -118,22 +118,21 @@ rio_shuttingdown(void)
 /* size of riopriv bitset */
 static u_int rio_max_workers = PAGE_SIZE * NBBY;
 SYSCTL_UINT(_kern_rio, OID_AUTO, max_workers, CTLFLAG_RDTUN, &rio_max_workers,
-    0, "Max worker processes (sizes vmspace bitset)");
+    0, "Max worker processes (sizes worker affinity bitset)");
 
-/* private vmspace RIO context */
-BITSET_DEFINE_VAR(riopriv);
+BITSET_DEFINE_VAR(rio_worker_affinity);
 
 static inline void
 rio_vmspace_init(struct vmspace *vm)
 {
-	struct riopriv *priv;
+	struct rio_worker_affinity *waff;
 
 	if (vm->vm_rio != NULL) {
 		return;
 	}
-	priv = BITSET_ALLOC(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
-	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)priv)) {
-		BITSET_FREE(priv, M_RIO);
+	waff = BITSET_ALLOC(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
+	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)waff)) {
+		BITSET_FREE(waff, M_RIO);
 	}
 }
 
@@ -1098,7 +1097,6 @@ struct rio_worker {
 	struct cv		rw_cond;
 	struct rio_srcios	rw_srcios;
 	rio_srcio_handler_f	*rw_handler;	/* specialized handler */
-	struct proc		*rw_hint;	/* last enqueued proc */
 	u_int			rw_len;
 	u_int			rw_cpu;
 	u_int			rw_id;
@@ -1210,14 +1208,14 @@ rio_worker_lookup(u_int id)
 void
 rio_vmspace_exit(struct vmspace *vm)
 {
-	struct riopriv *workers = vm->vm_rio;
+	struct rio_worker_affinity *waff = vm->vm_rio;
 	size_t id;
 
-	if (workers == NULL) {
+	if (waff == NULL) {
 		return;
 	}
 	/* Signal any sleeping workers using this vmspace. */
-	BIT_FOREACH_ISSET(rio_max_workers, id, workers) {
+	BIT_FOREACH_ISSET(rio_max_workers, id, waff) {
 		struct rio_worker *worker = rio_worker_lookup(id);
 
 		mtx_lock(&worker->rw_lock);
@@ -1226,7 +1224,7 @@ rio_vmspace_exit(struct vmspace *vm)
 		}
 		mtx_unlock(&worker->rw_lock);
 	}
-	BITSET_FREE(workers, M_RIO);
+	BITSET_FREE(waff, M_RIO);
 	vm->vm_rio = NULL;
 }
 
@@ -1262,6 +1260,7 @@ struct rio_selector {
 	u_int		rs_len;
 	u_int		rs_min;
 	u_int		rs_n;
+	struct rio_worker_affinity	*rs_vmspace_waff;
 };
 
 static inline void
@@ -1275,10 +1274,11 @@ rio_selector_init(struct rio_selector *sel, u_int len)
 	sel->rs_len = len;
 	sel->rs_min = UINT_MAX;
 	sel->rs_n = 0;
+	sel->rs_vmspace_waff = NULL;
 }
 
 static inline void
-rio_selector_reset(struct rio_selector *sel)
+rio_selector_reset(struct rio_selector *sel, struct rio_srcio *srcio)
 {
 	u_int stop = sel->rs_len - 1;
 
@@ -1287,6 +1287,8 @@ rio_selector_reset(struct rio_selector *sel)
 	bit_nclear(sel->rs_minimum, 0, stop);
 	sel->rs_min = UINT_MAX;
 	sel->rs_n = 0;
+	sel->rs_vmspace_waff = srcio->rs_sc->sc_vmspace->vm_rio;
+	MPASS(sel->rs_vmspace_waff != NULL);
 }
 
 #if 0
@@ -1305,8 +1307,7 @@ dump_bits(bitstr_t *bits, size_t len)
 #endif
 
 static inline void
-rio_selector_insert(struct rio_selector *sel, struct rio_srcio *srcio,
-    struct rio_worker *worker)
+rio_selector_insert(struct rio_selector *sel, struct rio_worker *worker)
 {
 	u_int idx = sel->rs_n++;
 	/* XXX: Unlocked, but it's probably good enough. */
@@ -1315,7 +1316,7 @@ rio_selector_insert(struct rio_selector *sel, struct rio_srcio *srcio,
 	if (qlen == 0) {
 		bit_set(sel->rs_empty, idx);
 	}
-	if (worker->rw_hint == rio_srcio_proc(srcio)) {
+	if (BIT_ISSET(rio_max_workers, worker->rw_id, sel->rs_vmspace_waff)) {
 		bit_set(sel->rs_affine, idx);
 	}
 	if (qlen == sel->rs_min) {
@@ -1402,10 +1403,10 @@ rio_scheduler_reset(struct rio_scheduler *sched, struct rio_worker *workers,
 {
 	struct rio_selector *sel = &sched->rs_sel;
 
-	rio_selector_reset(sel);
+	rio_selector_reset(sel, srcio);
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
-		rio_selector_insert(sel, srcio, workers + i);
+		rio_selector_insert(sel, workers + i);
 	}
 	MPASS(sel->rs_n == len);
 	MPASS(sel->rs_min != UINT_MAX);
