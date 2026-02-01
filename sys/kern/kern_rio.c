@@ -65,7 +65,37 @@ static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 
 typedef int rio_src_scheduler_f(struct rio_softc *);
 
-/* TODO: come up with a set of useful scheduling policies */
+/*
+ * TODO: come up with a set of useful scheduling policies.
+ *
+ * Useful means different things, so policies are defined broadly by two
+ * parameters: the behavior, and the configuration.
+ *
+ * Behavior encapsulates run-time decision-making.
+ *
+ * Configuration is split across two planes: user and system.  User policy
+ * config is controlled by ioctls, system policy config is controlled by
+ * sysctls.
+ *
+ * How should policy be defined?  An nvlist would be very extensible for sure,
+ * or simply per-policy ioctls.
+ *
+ * As a starting point, all points of policy influence should be identified and
+ * codified into a generic policy interface.  Then specific policies can be
+ * implemented and exposed.
+ *
+ * Prior art: see domainset(9)
+ *
+ * Scheduling policy shall be implemented with mathematical rigor and precision.
+ * System-level constraints, such as fairness, define a set of feasible choices.
+ * The objective functions apply configured weights to observable metrics and
+ * produce a score for each available choice, and the most favorable is chosen.
+ *
+ * A predefined set of policies are to be provided as predetermined weights
+ * optimizing for typical concerns (e.g. locality, age, depth).
+ *
+ * For implementation utility and observability, see qmath(3) and stats(3).
+ */
 static rio_src_scheduler_f rio_src_scheduler_none;
 
 static rio_src_scheduler_f *rio_src_policies[] = {
@@ -377,6 +407,12 @@ rio_submissions_dequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 	return (NULL);
 }
 
+/*
+ * TODO: Perhaps a variation to dequeue several in a batch if available?  Batch
+ * size could be configured by policy.  The caller would supply a buffer to fill
+ * with pointers.  The lock would remain held and only one event counter change
+ * would be needed.
+ */
 static inline struct riocb *
 rio_submissions_dequeue(struct rio_softc *sc, uint32_t *indexp)
 {
@@ -1228,7 +1264,7 @@ rio_vmspace_exit(struct vmspace *vm)
 	vm->vm_rio = NULL;
 }
 
-/* TODO: schedulers deep dive */
+/* TODO: src/flow schedulers deep dive */
 /* XXX: this is a potentially confusing name */
 static int
 rio_src_scheduler_none(struct rio_softc *sc)
@@ -1382,6 +1418,8 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
  * local workers are all busy.  But, we also want to utilize idle CPU time to
  * minimize latency and maximize throughput.  Optimizing the balance of these
  * priorities is the role of the policy.
+ *
+ * TODO: Flow vnet affinity.
  */
 struct rio_scheduler {
 	struct rio_selector	rs_sel;
@@ -1674,6 +1712,7 @@ rio_worker_proc(void *arg)
 		enum rio_status status;
 		int error;
 
+		/* TODO: Work stealing! */
 		if ((error = rio_worker_dequeue(self, &srcio)) == ESHUTDOWN) {
 			break;
 		}
