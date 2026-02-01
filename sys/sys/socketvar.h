@@ -499,6 +499,8 @@ int	sosockaddr(struct socket *so, struct sockaddr *sa);
 void	soaio_enqueue(struct task *task);
 void	soaio_rcv(void *context, int pending);
 void	soaio_snd(void *context, int pending);
+void	sorio_rcv(void *context, int pending);
+void	sorio_snd(void *context, int pending);
 int	socheckuid(struct socket *so, uid_t uid);
 int	sobind(struct socket *so, struct sockaddr *nam, struct thread *td);
 int	sobindat(int fd, struct socket *so, struct sockaddr *nam,
@@ -564,6 +566,7 @@ void	solisten_upcall_set(struct socket *, so_upcall_t, void *);
 void	sorwakeup_locked(struct socket *);
 void	sowwakeup_locked(struct socket *);
 void	sowakeup_aio(struct socket *, sb_which);
+void	sowakeup_rio(struct socket *, sb_which);
 void	solisten_wakeup(struct socket *);
 int	selsocket(struct socket *so, int events, struct timeval *tv,
 	    struct thread *td);

@@ -26,10 +26,14 @@
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
+#include <sys/protosw.h>
 #include <sys/queue.h>
 #include <sys/rio.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
+#include <sys/sockbuf.h>
+#include <sys/socket.h>
+#include <sys/socketvar.h>
 #include <sys/stat.h>
 #include <sys/sx.h>
 #include <sys/syscallsubr.h>
@@ -43,7 +47,11 @@
 
 #include <geom/geom.h>
 
+#include <net/vnet.h>
+
 #include <rio/rio_internal.h>
+
+#include <security/mac/mac_framework.h>
 
 #include <vm/pmap.h>
 #include <vm/uma.h>
@@ -121,6 +129,10 @@ static u_int rio_flow_sync_workers = 4;
 SYSCTL_UINT(_kern_rio_flow, OID_AUTO, sync_workers, CTLFLAG_RDTUN,
     &rio_flow_sync_workers, 0, "Max number of write workers per CPU flow");
 
+static u_int rio_flow_socket_workers = 4;
+SYSCTL_UINT(_kern_rio_flow, OID_AUTO, socket_workers, CTLFLAG_RDTUN,
+    &rio_flow_socket_workers, 0, "Max number of socket workers per CPU flow");
+
 /* TODO: other worker classes */
 
 /* Deferred softc destruction. */
@@ -179,6 +191,44 @@ rio_vmspace_switch(struct vmspace *vm, u_int id)
 			BIT_SET_ATOMIC(rio_max_workers, id, vm->vm_rio);
 		}
 		vmspace_switch_aio(vm);
+	}
+}
+
+BITSET_DEFINE_VAR(rio_flow_affinity);
+
+VNET_DEFINE_STATIC(struct rio_flow_affinity *, rio_vnet_flow_affinity);
+#define V_rio_vnet_flow_affinity VNET(rio_vnet_flow_affinity)
+
+static void
+rio_vnet_init(const void *arg __unused)
+{
+	V_rio_vnet_flow_affinity = BITSET_ALLOC(mp_ncpus, M_RIO,
+	    M_WAITOK | M_ZERO);
+}
+VNET_SYSINIT(rio_vnet_init, SI_SUB_PROTO_BEGIN, SI_ORDER_ANY, rio_vnet_init,
+    NULL);
+
+static void
+rio_vnet_uninit(const void *arg __unused)
+{
+	BITSET_FREE(V_rio_vnet_flow_affinity, M_RIO);
+}
+VNET_SYSUNINIT(rio_vnet_uninit, SI_SUB_PROTO_BEGIN, SI_ORDER_ANY,
+    rio_vnet_uninit, NULL);
+
+static inline void
+rio_vnet_switch(struct vnet *vnet)
+{
+	if (vnet != curvnet) {
+		if (curvnet != NULL) {
+			BIT_CLR_ATOMIC(mp_ncpus, curcpu,
+			    V_rio_vnet_flow_affinity);
+		}
+		if (vnet != NULL) {
+			BIT_SET_ATOMIC(mp_ncpus, curcpu,
+			    VNET_VNET(vnet, rio_vnet_flow_affinity));
+		}
+		/* The network stack updates curvnet itself as needed. */
 	}
 }
 
@@ -1277,6 +1327,293 @@ rio_srcio_sync(struct rio_srcio *srcio, u_int id)
 	rio_srcio_complete(srcio);
 }
 
+static inline bool
+rio_soready(struct socket *so, sb_which which)
+{
+	return (which == SO_SND ? sowriteable(so) : soreadable(so));
+}
+
+static inline bool
+riocb_canceled(struct riocb *iocb)
+{
+	return (atomic_load_int(&iocb->rio_error) == ECANCELED);
+}
+
+static inline struct rio_srcio *
+rio_sockbuf_takefirst(struct sockbuf *sb)
+{
+	struct rio_srcio *srcio;
+
+	if ((srcio = STAILQ_FIRST(&sb->sb_riosrcios)) != NULL) {
+		STAILQ_REMOVE_HEAD(&sb->sb_riosrcios, rs_srcios);
+	}
+	return (srcio);
+}
+
+#ifdef RIO_SOCK_BUF_DEBUG
+#define RIO_SOCK_BUF_LOCK(sb, which) ({ \
+	printf("%s:%d LOCK sb=%p which=%d\n", __func__, __LINE__, sb, which); \
+	SOCK_BUF_LOCK(sb, which); \
+})
+#define RIO_SOCK_BUF_LOCK_ASSERT(sb, which) ({ \
+	printf("%s:%d LOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	SOCK_BUF_LOCK_ASSERT(sb, which); \
+})
+#define RIO_SOCK_BUF_UNLOCK_ASSERT(sb, which) ({ \
+	printf("%s:%d UNLOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	SOCK_BUF_UNLOCK_ASSERT(sb, which); \
+})
+#define RIO_SOCK_BUF_UNLOCK(sb, which) ({ \
+	printf("%s:%d UNLOCK sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	SOCK_BUF_UNLOCK(sb, which); \
+})
+#else
+#define RIO_SOCK_BUF_LOCK		SOCK_BUF_LOCK
+#define RIO_SOCK_BUF_LOCK_ASSERT	SOCK_BUF_LOCK_ASSERT
+#define RIO_SOCK_BUF_UNLOCK_ASSERT	SOCK_BUF_UNLOCK_ASSERT
+#define RIO_SOCK_BUF_UNLOCK		SOCK_BUF_UNLOCK
+#endif
+
+static inline struct rio_srcio_ext *
+rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
+{
+	struct rio_srcio *srcio = &rse->rse_srcio;
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = rio_io_kiocb(io);
+	struct uio *uio = srcio->rs_uio;
+	struct file *fp = io->rio_fd_file;
+	struct socket *so = fp->f_data;
+	struct sockbuf *sb = sobuf(so, which);
+	size_t orig, completed = rse->rse_completed;
+	int flags, error = 0;
+
+	/* We won't race with another RIO worker thanks to SB_RIO_RUNNING. */
+	RIO_SOCK_BUF_UNLOCK(so, which);
+	if (uio == NULL) {
+		if (rio_io_vectored(io)) {
+			if ((error = copyinuio(kiocb->rio_iov,
+			    kiocb->rio_length, &uio)) != 0) {
+				goto complete;
+			}
+		} else {
+			struct iovec *iov = &rse->rse_iov;
+
+			iov->iov_base = kiocb->rio_buf;
+			iov->iov_len = kiocb->rio_length;
+			uio = &rse->rse_uio;
+			uio->uio_iov = iov;
+			uio->uio_iovcnt = 1;
+			uio->uio_resid = kiocb->rio_length;
+			uio->uio_segflg = UIO_USERSPACE;
+		}
+		uio->uio_offset = kiocb->rio_offset;
+		uio->uio_rw = which == SO_RCV ? UIO_READ : UIO_WRITE;
+		srcio->rs_uio = uio;
+	}
+	uio->uio_td = curthread;
+	orig = uio->uio_resid;
+	rio_vnet_switch(so->so_vnet);
+	flags = MSG_NBIO;
+	switch (which) {
+	case SO_SND:
+		if (!STAILQ_EMPTY(&sb->sb_riosrcios)) {
+			flags |= MSG_MORETOCOME;
+		}
+#ifdef MAC
+		error = mac_socket_check_send(fp->f_cred, so);
+#endif
+		if (__predict_true(error == 0)) {
+			error = sousrsend(so, NULL, uio, NULL, flags,
+			    sc->sc_proc);
+		}
+		break;
+	case SO_RCV:
+#ifdef MAC
+		error = mac_socket_check_receive(fp->f_cred, so);
+#endif
+		if (__predict_true(error == 0)) {
+			error = soreceive(so, NULL, uio, NULL, NULL, &flags);
+		}
+		break;
+	}
+	completed += orig - uio->uio_resid;
+	rse->rse_completed = completed;
+	if (__predict_false(error == EWOULDBLOCK) &&
+	    (completed == 0 || (so->so_state & SS_NBIO) == 0)) {
+		struct riocb *iocb;
+
+		RIO_SOCK_BUF_LOCK(so, which);
+		/* TODO: empty counter */
+		printf("%s: empty\n", __func__);
+		if (rio_soready(so, which)) {
+			/* Readied up while waiting for lock. */
+			/* TODO: retry counter */
+			printf("%s: retry\n", __func__);
+			return (rse);
+		}
+		iocb = rio_srcio_iocb(srcio);
+		if (__predict_false(riocb_canceled(iocb))) {
+			RIO_SOCK_BUF_UNLOCK(so, which);
+			if (completed == 0) {
+				error = ECANCELED;
+			}
+			goto complete;
+		}
+		/*
+		 * The socket is blocked and we can't complete early.  Keep our
+		 * place at the head of the queue and wait for the next wakeup.
+		 */
+		STAILQ_INSERT_HEAD(&sb->sb_riosrcios, srcio, rs_srcios);
+		return (NULL);
+	}
+	if (__predict_true(completed > 0)) {
+		switch (__builtin_expect(0, error)) {
+		case EINTR:
+		case ERESTART:
+		case EWOULDBLOCK:
+			/* Allow early completion if interrupted. */
+			error = 0;
+			break;
+		default:
+			break;
+		}
+	}
+complete:
+	RIO_SOCK_BUF_UNLOCK_ASSERT(so, which);
+	if (__predict_true(error == 0)) {
+		kiocb->rio_status = completed;
+		kiocb->rio_error = 0;
+		rio_srcio_complete(srcio);
+	} else {
+		rio_srcio_error(srcio, error);
+	}
+	RIO_SOCK_BUF_LOCK(so, which);
+	return (rio_srcio_ext(rio_sockbuf_takefirst(sb)));
+}
+
+static void
+rio_srcio_socket(struct rio_srcio *srcio, u_int id)
+{
+	struct rio_srcio_ext *rse = rio_srcio_ext(srcio);
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct file *fp = io->rio_fd_file;
+	struct socket *so = fp->f_data;
+	struct sockbuf *sb;
+	struct thread *td = curthread;
+	struct ucred *saved_cred = td->td_ucred;
+	sb_which which;
+
+	td->td_ucred = sc->sc_cred;
+	rio_srcio_vmspace_switch(srcio, id);
+	switch (rio_io_cmd(io)) {
+	case RIO_READ:
+		which = SO_RCV;
+		break;
+	case RIO_WRITE:
+		which = SO_SND;
+		break;
+	/* TODO: other socket commands */
+	default:
+		__assert_unreachable();
+	}
+	sb = sobuf(so, which);
+	RIO_SOCK_BUF_LOCK(so, which);
+	MPASS((sb->sb_flags & SB_RIO_RUNNING) != 0);
+	/* TODO: accept command? */
+	if (__predict_false(SOLISTENING(so))) {
+		/* Any queued commands are invalid for a listening socket. */
+		do {
+			rio_srcio_error(srcio, EINVAL);
+		} while ((srcio = rio_sockbuf_takefirst(sb)) != NULL);
+	} else {
+		while ((rse = rio_srcio_ext_sockbuf(rse, which)) != NULL) {
+			continue;
+		}
+	}
+	sb->sb_flags &= ~SB_RIO_RUNNING;
+	RIO_SOCK_BUF_UNLOCK(so, which);
+	td->td_ucred = saved_cred;
+}
+
+void
+sowakeup_rio(struct socket *so, sb_which which)
+{
+	struct sockbuf *sb = sobuf(so, which);
+
+	RIO_SOCK_BUF_LOCK_ASSERT(so, which);
+	MPASS(!STAILQ_EMPTY(&sb->sb_riosrcios));
+
+	if ((sb->sb_flags & SB_RIO_RUNNING) == 0) {
+		sb->sb_flags |= SB_RIO_RUNNING;
+		taskqueue_enqueue(taskqueue_thread, &sb->sb_riotask);
+	}
+}
+
+static inline bool
+rio_srcio_socket_enqueue(struct rio_srcio *srcio)
+{
+	struct rio_io *io = srcio->rs_io;
+	struct file *fp = io->rio_fd_file;
+	struct socket *so;
+	struct sockbuf *sb;
+	sb_which which;
+
+	/*
+	 * At this point, adapting the fo_aio_queue interface to a more generic
+	 * continuation-passing style could be a logical next step.
+	 *
+	 * Alternatively, skip a few steps and come up with a generic CPS UIO
+	 * interface for the kernel?
+	 *
+	 * Basic needs:
+	 *  - an embedded uio member
+	 *  - a completion callback
+	 *  - a cancellation point callback? what is that called...
+	 *  - queue linkage
+	 *  - arbitrary context (struct inheritance via nesting)
+	 *
+	 * The completion callback is responsible for releasing resources, so
+	 * embedding in an arbitrary struct for context similar to queue linkage
+	 * is an option.  Looks a lot like kaiocb with less baggage.  Heck,
+	 * embed it in kaiocb as a retrofit.  The AIO syscalls could be made to
+	 * invoke RIO instead of the AIO plumbing.  This does seem messier than
+	 * using RIO to implement AIO in librt/libc though.  Are syscalls
+	 * proxied through libc/libsys?
+	 *
+	 * "Core I/O" is catchy... or iocore
+	 */
+	if (fp == NULL || fp->f_type != DTYPE_SOCKET) {
+		return (false);
+	}
+	so = fp->f_data;
+	/* TODO: accept command? */
+	if (SOLISTENING(so)) {
+		rio_srcio_error(srcio, EINVAL);
+		return (true);
+	}
+	switch (rio_io_cmd(io)) {
+	case RIO_READ:
+		which = SO_RCV;
+		break;
+	case RIO_WRITE:
+		which = SO_SND;
+		break;
+	default:
+		rio_srcio_error(srcio, EINVAL);
+		return (true);
+	}
+	RIO_SOCK_BUF_LOCK(so, which);
+	sb = sobuf(so, which);
+	STAILQ_INSERT_TAIL(&sb->sb_riosrcios, srcio, rs_srcios);
+	if (rio_soready(so, which)) {
+		sowakeup_rio(so, which);
+	}
+	RIO_SOCK_BUF_UNLOCK(so, which);
+	return (true);
+}
+
 /*
  * A RIO worker is a kernel process pinned to a CPU.  The worker performs
  * blocking IO operations on behalf of a user process.   A worker must be a
@@ -1350,6 +1687,7 @@ struct rio_flow {
 	struct rio_worker *rf_read;
 	struct rio_worker *rf_write;
 	struct rio_worker *rf_sync;
+	struct rio_worker *rf_socket;
 	/* TODO: other worker classes */
 };
 DPCPU_DEFINE_STATIC(struct rio_flow, rio_flow);
@@ -1378,11 +1716,13 @@ static inline struct rio_worker *
 rio_worker_lookup(u_int id)
 {
 	const size_t flow_stride = rio_flow_read_workers +
-	    rio_flow_write_workers + rio_flow_sync_workers;
+	    rio_flow_write_workers + rio_flow_sync_workers +
+	    rio_flow_socket_workers;
 	const u_int class_strides[] = {
 		rio_flow_read_workers,
 		rio_flow_write_workers,
 		rio_flow_sync_workers,
+		rio_flow_socket_workers,
 	};
 	/* TODO: more classes? */
 	struct rio_flow *flow = DPCPU_ID_PTR(id / flow_stride, rio_flow);
@@ -1595,6 +1935,13 @@ rio_scheduler_init(struct rio_scheduler *sched, struct rio_issuer *issuer)
 }
 
 static inline void
+rio_scheduler_sockinit(struct rio_scheduler *sched, int *phasep)
+{
+	sched->rs_phase = phasep;
+	rio_selector_init(&sched->rs_sel, rio_flow_socket_workers);
+}
+
+static inline void
 rio_scheduler_reset(struct rio_scheduler *sched, struct rio_worker *workers,
     u_int len, struct rio_srcio *srcio)
 {
@@ -1728,13 +2075,87 @@ rio_scheduler_destroy(struct rio_scheduler *sched)
 	rio_selector_destroy(&sched->rs_sel);
 }
 
-static inline bool
-riocb_canceled(struct riocb *iocb)
+/* TODO: remote flow selection process */
+/*
+ * Rough outline of the process:
+ *
+ * local_node = cpuset_domain[PCPU_GET(domain)]
+ *
+ * If all local flow queue depths exceed policy threshold:
+ *
+ * CPU_FOREACH_ISSET(cpu, local_node)
+ *     try to find a suitable near flow
+ *
+ * If all near flow queue depths exceed policy threshold:
+ *
+ * CPU_FOREACH_ISCLR(cpu, local_node)
+ *     if cpu >= mp_ncpus
+ *         break
+ *     try to find a suitable far flow
+ *
+ * If all exceed policy for selection, pick the minimum?  Local preference?
+ *
+ * Vnet flow affinity also is an available factor.
+ */
+
+struct rio_socket_issuer {
+	struct rio_scheduler	rsi_sched;
+	struct mtx		rsi_lock;
+	int			rsi_phase;
+};
+DPCPU_DEFINE_STATIC(struct rio_socket_issuer, rio_socket_issuer);
+
+static inline void
+rio_socket_issuer_init(struct rio_socket_issuer *rsi)
 {
-	return (atomic_load_int(&iocb->rio_error) == ECANCELED);
+	rio_scheduler_sockinit(&rsi->rsi_sched, &rsi->rsi_phase);
+	mtx_init(&rsi->rsi_lock, "rio socket issuer lock", NULL, MTX_DEF);
 }
 
-/* TODO: remote flow selection process */
+static inline void
+rio_socket_issuer_destroy(struct rio_socket_issuer *rsi)
+{
+	rio_scheduler_destroy(&rsi->rsi_sched);
+	mtx_destroy(&rsi->rsi_lock);
+}
+
+static inline void
+rio_socket_schedule(struct socket *so, sb_which which)
+{
+	struct rio_socket_issuer *rsi = DPCPU_PTR(rio_socket_issuer);
+	struct rio_srcio *srcio;
+	struct rio_srcio_ext *rse;
+	struct rio_flow *flow;
+	struct rio_worker *worker;
+	struct sockbuf *sb = sobuf(so, which);
+
+	/* TODO: optimizations for PF_UNIX? */
+	RIO_SOCK_BUF_LOCK(so, which);
+	MPASS((sb->sb_flags & SB_RIO_RUNNING) != 0);
+	srcio = rio_sockbuf_takefirst(sb);
+	MPASS(srcio != NULL);
+	RIO_SOCK_BUF_UNLOCK(so, which);
+	rse = rio_srcio_ext(srcio);
+	flow = DPCPU_ID_PTR(rse->rse_cpu, rio_flow);
+	mtx_lock(&rsi->rsi_lock);
+	worker = rio_scheduler_select_worker(&rsi->rsi_sched, flow->rf_socket,
+	    rio_flow_socket_workers, srcio);
+	/* TODO: how does flow affinity fit in to remote worker selection? */
+	mtx_unlock(&rsi->rsi_lock);
+	rio_worker_enqueue(worker, srcio);
+}
+
+void
+sorio_snd(void *context, int pending __unused)
+{
+	rio_socket_schedule(context, SO_SND);
+}
+
+void
+sorio_rcv(void *context, int pending __unused)
+{
+	rio_socket_schedule(context, SO_RCV);
+}
 
 /* TODO: tuning */
 static u_int rio_attention_span = 1024;
@@ -1838,6 +2259,10 @@ next:
 				continue;
 			default:
 				break;
+			}
+			/* Handle sockets with non-blocking operations. */
+			if (rio_srcio_socket_enqueue(srcio)) {
+				continue;
 			}
 			rio_scheduler_schedule(&sched, srcio);
 		}
@@ -2021,21 +2446,35 @@ rio_load(void)
 		flow = DPCPU_ID_PTR(cpu, rio_flow);
 		if ((error = rio_issuer_init(&flow->rf_issuer, cpu)) != 0) {
 			/* TODO: error handling */
+			printf("%s: rio_issuer_init: %d\n", __func__, error);
 			return (error);
 		}
 		if ((error = rio_workerclass_init(flow, read, cpu)) != 0) {
 			/* TODO: error handling */
+			printf("%s: rio_workerclass_init (read): %d\n",
+			    __func__, error);
 			return (error);
 		}
 		if ((error = rio_workerclass_init(flow, write, cpu)) != 0) {
 			/* TODO: error handling */
+			printf("%s: rio_workerclass_init (write): %d\n",
+			    __func__, error);
 			return (error);
 		}
 		if ((error = rio_workerclass_init(flow, sync, cpu)) != 0) {
 			/* TODO: error handling */
+			printf("%s: rio_workerclass_init (sync): %d\n",
+			    __func__, error);
+			return (error);
+		}
+		if ((error = rio_workerclass_init(flow, socket, cpu)) != 0) {
+			/* TODO: error handling */
+			printf("%s: rio_workerclass_init (socket): %d\n",
+			    __func__, error);
 			return (error);
 		}
 		/* TODO: more worker classes? */
+		rio_socket_issuer_init(DPCPU_ID_PTR(cpu, rio_socket_issuer));
 	}
 	return (0);
 }
@@ -2099,7 +2538,9 @@ rio_shutdown(void)
 		rio_workerclass_destroy(flow, read);
 		rio_workerclass_destroy(flow, write);
 		rio_workerclass_destroy(flow, sync);
+		rio_workerclass_destroy(flow, socket);
 		/* TODO: more worker classes? */
+		rio_socket_issuer_destroy(DPCPU_ID_PTR(cpu, rio_socket_issuer));
 	}
 	taskqueue_quiesce(rio_doom);
 	taskqueue_free(rio_doom);

@@ -46,7 +46,7 @@
 #define	SB_NOCOALESCE	0x200		/* don't coalesce new data into existing mbufs */
 #define	SB_IN_TOE	0x400		/* socket buffer is in the middle of an operation */
 #define	SB_AUTOSIZE	0x800		/* automatically size socket buffer */
-/* was	SB_STOP		0x1000		*/
+#define	SB_RIO_RUNNING	0x1000		/* RIO operation running */
 #define	SB_AIO_RUNNING	0x2000		/* AIO operation running */
 #define	SB_SPLICED	0x4000		/* socket buffer is spliced;
 					   previously used for SB_TLS_IFNET */
@@ -101,6 +101,8 @@ struct sockbuf {
 	void	*sb_upcallarg;
 	TAILQ_HEAD(, kaiocb) sb_aiojobq;	/* pending AIO ops */
 	struct	task sb_aiotask;		/* AIO task */
+	STAILQ_HEAD(, rio_srcio) sb_riosrcios;	/* pending RIO ops */
+	struct	task sb_riotask;		/* RIO task */
 	union {
 		/*
 		 * Classic BSD one-size-fits-all socket buffer, capable of
@@ -143,6 +145,7 @@ struct sockbuf {
 			u_int			uxst_flags;
 #define	UXST_PEER_AIO	0x1
 #define	UXST_PEER_SEL	0x2
+#define	UXST_PEER_RIO	0x4
 		};
 		/*
 		 * PF_UNIX/SOCK_DGRAM
@@ -313,6 +316,12 @@ sbspace(struct sockbuf *sb)
 		(sb)->sb_lastrecord = NULL;				\
 	}								\
 } while (/*CONSTCOND*/0)
+
+static inline bool
+sbrioqueued(const struct sockbuf *sb)
+{
+	return (!STAILQ_EMPTY(&sb->sb_riosrcios));
+}
 
 #ifdef SOCKBUF_DEBUG
 void	sblastrecordchk(struct sockbuf *, const char *, int);

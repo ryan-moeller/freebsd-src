@@ -486,6 +486,8 @@ sowakeup(struct socket *so, const sb_which which)
 		ret = SU_OK;
 	if (sb->sb_flags & SB_AIO)
 		sowakeup_aio(so, which);
+	if (sbrioqueued(sb))
+		sowakeup_rio(so, which);
 	SOCK_BUF_UNLOCK(so, which);
 	if (ret == SU_ISCONNECTED)
 		soisconnected(so);
@@ -527,7 +529,7 @@ static __always_inline bool
 sb_notify(const struct sockbuf *sb)
 {
 	return ((sb->sb_flags & (SB_WAIT | SB_SEL | SB_ASYNC |
-	    SB_UPCALL | SB_AIO | SB_KNOTE)) != 0);
+	    SB_UPCALL | SB_AIO | SB_KNOTE)) != 0 || sbrioqueued(sb));
 }
 
 void
