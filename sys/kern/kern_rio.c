@@ -202,6 +202,12 @@ rio_io_flags(struct rio_io *io)
 	return (io->rio_cb.rio_cmd & RIO_CMD_FLAGS);
 }
 
+static inline bool
+rio_io_vectored(struct rio_io *io)
+{
+	return ((rio_io_flags(io) & RIO_VECTORED) != 0);
+}
+
 static inline struct riocb *
 rio_io_kiocb(struct rio_io *io)
 {
@@ -481,6 +487,28 @@ rio_destroy(struct rio_softc *sc)
 }
 
 static inline void
+rio_iocb_complete(struct rio_softc *sc, struct riocb *iocb, int cberror,
+    ssize_t cbstatus)
+{
+	uint32_t index = iocb - sc->sc_rio->rio_control;
+	int error;
+
+	iocb->rio_error = cberror;
+	iocb->rio_status = cbstatus;
+	atomic_thread_fence_rel();
+	error = rio_completions_enqueue(sc, index);
+	if (__predict_false(error == EINVAL)) {
+		/* The user is misbehaving. */
+		rio_destroy(sc);
+	}
+	MPASS(error == 0);
+	if (__predict_false(rio_status(sc) != RIO_OPEN) &&
+	    __predict_false(rio_inflight(sc) == 0)) {
+		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
+	}
+}
+
+static inline void
 rio_ring_init(struct rio_ring *ring, u_int size)
 {
 	ck_ring_init(&ring->rr_ring, size);
@@ -658,16 +686,126 @@ rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
 	return (0);
 }
 
+/*
+ * Issuer outlets:
+ *
+ * a. Error - no dependencies
+ * b. Blocking sync - vmspace only
+ * c. Blocking non-vectored uio - vmspace, uio/iovec fits on stack
+ * d. Blocking vectored uio - vmspace, uio/iovecs allocated/freed
+ * e. Non-blocking non-vectored uio - vmspace, uio/iovec allocated/freed
+ * f. Non-blocking vectored uio - vmspace, uio/iovecs allocated/freed
+ * g. Callback-driven non-vectored bio strategy - bio/pages allocated/freed
+ * h. Callback-driven vectored bio strategy - vmspace, bio/pages allocated/freed
+ *
+ * > Any vectored command (RIO_VECTORED) requires the rio_iov pointer to be
+ *   validated before use.  This is most readily achieved by copyin, or more
+ *   practically by copyiniov or most likely copyinuio.  Those also require
+ *   use of the user vmspace, which implies it must occur in a worker.  They
+ *   also imply malloc/free for the iovecs/uio.
+ *
+ * > Non-vectored commands do not need to validate a pointer to iovecs, but
+ *   typically will need the process's vmspace for blocking I/O operations.
+ *
+ * > Except any socket operation that might have to wait has to be prepared to
+ *   make incremental progress on a uio in multiple attempts, so the uio has to
+ *   outlive any original stack, implying malloc/free for iovecs/uio, whether
+ *   or not the command itself is vectored.
+ *
+ * > Devices with a bio_strategy handler don't even use a uio/iovecs for I/O,
+ *   they use bios.  If we're not doing vectored I/O, we don't need a worker.
+ *   We can issue non-blocking bio operations directly and let bio_done handle
+ *   completion.  We just have to fault/hold/unhold the pages ourselves.  That
+ *   might be better off happening in a worker, depending how slow faults are.
+ *
+ * So, there is a subset of commands that only needs to validate/fault user
+ * buffers, which is performed by the requested operation, so a uio/iovec can be
+ * on the stack.  Other commands will require a persistent uio from the heap for
+ * repeated operations, but no iovec validation.  Some require iovecs validation
+ * but do blocking I/O so the uio can be on the stack in a worker process.
+ * Finally, there are the commands that must validate an iovec array and persist
+ * the uio/iovecs on the heap.
+ *
+ * We use a small rio_srcio structure for blocking or callback-driven commands.
+ * The larger rio_srcio_ext structure extends rio_srcio with additional fields
+ * needed for non-blocking I/O (sockets).  The size of rio_srcio is small enough
+ * to land in a smaller UMA bucket than rio_srcio_ext (<32B vs. <128B).  The
+ * rio_uio structure provides storage and common setup of uio/iovecs on the
+ * stack for blocking operations.
+ */
+
 struct rio_srcio {
-	struct rio_softc	*rs_sc;	/* io source context */
-	struct rio_io		*rs_io;	/* io request */
+	struct rio_softc	*rs_sc;		/* io source context */
+	struct rio_io		*rs_io;		/* io request */
+	struct uio		*rs_uio;	/* allocated or in ext */
 	STAILQ_ENTRY(rio_srcio)	rs_srcios;
 };
 STAILQ_HEAD(rio_srcios, rio_srcio);
 
 static uma_zone_t rio_srcio_zone;
 
+struct rio_srcio_ext {
+	struct rio_srcio	rse_srcio;
+	struct uio		rse_uio;
+	struct iovec		rse_iov;
+	size_t			rse_completed;
+	u_int			rse_cpu;
+};
+
+static uma_zone_t rio_srcio_ext_zone;
+
 typedef void rio_srcio_handler_f(struct rio_srcio *, u_int);
+
+static inline struct rio_srcio_ext *
+rio_srcio_ext(struct rio_srcio *srcio)
+{
+	return (__containerof(srcio, struct rio_srcio_ext, rse_srcio));
+}
+
+static inline uma_zone_t
+rio_file_srcio_zone(struct file *fp)
+{
+	if (fp != NULL && fp->f_type == DTYPE_SOCKET) {
+		return (rio_srcio_ext_zone);
+	}
+	return (rio_srcio_zone);
+}
+
+static inline struct rio_srcio *
+rio_srcio_new(struct rio_softc *sc, struct rio_io *io)
+{
+	struct rio_srcio *srcio;
+	uma_zone_t zone = rio_file_srcio_zone(io->rio_fd_file);
+
+	srcio = uma_zalloc(zone, M_WAITOK);
+	srcio->rs_sc = sc;
+	srcio->rs_io = io;
+	srcio->rs_uio = NULL;
+	if (zone == rio_srcio_ext_zone) {
+		struct rio_srcio_ext *rse = rio_srcio_ext(srcio);
+
+		rse->rse_completed = 0;
+		rse->rse_cpu = curcpu;
+	}
+	return (srcio);
+}
+
+static inline void
+rio_srcio_free(struct rio_srcio *srcio, uma_zone_t zone)
+{
+	if (zone == rio_srcio_ext_zone) {
+		struct rio_srcio_ext *rse = rio_srcio_ext(srcio);
+
+		if (srcio->rs_uio == &rse->rse_uio) {
+			/* Don't try to free the ext uio. */
+			srcio->rs_uio = NULL;
+		}
+	}
+	if (srcio->rs_uio != NULL) {
+		freeuio(srcio->rs_uio);
+	}
+	uma_zfree(zone, srcio);
+}
 
 static inline uint32_t
 rio_srcio_index(struct rio_srcio *srcio)
@@ -691,27 +829,14 @@ rio_srcio_complete(struct rio_srcio *srcio)
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
 	struct riocb *iocb = rio_srcio_iocb(srcio);
-	uint32_t index = rio_srcio_index(srcio);
-	int error;
+	uma_zone_t zone = rio_file_srcio_zone(io->rio_fd_file);
 
-	/* Must release resources before io can be reused. */
+	/* Must release file before io can be reused. */
 	if (io->rio_fd_file != NULL) {
 		fdrop(io->rio_fd_file, NULL);
 	}
-	iocb->rio_error = kiocb->rio_error;
-	iocb->rio_status = kiocb->rio_status;
-	atomic_thread_fence_rel();
-	error = rio_completions_enqueue(sc, index);
-	if (__predict_false(error == EINVAL)) {
-		/* The user is misbehaving. */
-		rio_destroy(sc);
-	}
-	MPASS(error == 0);
-	if (__predict_false(rio_status(sc) != RIO_OPEN) &&
-	    __predict_false(rio_inflight(sc) == 0)) {
-		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
-	}
-	uma_zfree(rio_srcio_zone, srcio);
+	rio_iocb_complete(sc, iocb, kiocb->rio_error, kiocb->rio_status);
+	rio_srcio_free(srcio, zone);
 }
 
 static inline void
@@ -722,6 +847,24 @@ rio_srcio_error(struct rio_srcio *srcio, int error)
 	kiocb->rio_error = error;
 	kiocb->rio_status = -1;
 	rio_srcio_complete(srcio);
+}
+
+static inline struct proc *
+rio_srcio_proc(struct rio_srcio *srcio)
+{
+	return (srcio->rs_sc->sc_proc);
+}
+
+static inline struct vmspace *
+rio_srcio_vmspace(struct rio_srcio *srcio)
+{
+	return (srcio->rs_sc->sc_vmspace);
+}
+
+static inline void
+rio_srcio_vmspace_switch(struct rio_srcio *srcio, u_int id)
+{
+	rio_vmspace_switch(rio_srcio_vmspace(srcio), id);
 }
 
 static inline int
@@ -846,9 +989,7 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 	off_t offset = kiocb->rio_offset;
 	size_t resid;
 	u_int cmd = rio_io_cmd(io);
-	u_int flags = rio_io_flags(io);
 	int bsize, bio_cmd, error, ref = 0;
-	bool vectored = (flags & RIO_VECTORED) != 0;
 
 	switch (cmd) {
 	case RIO_READ:
@@ -868,8 +1009,11 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 		return (EINVAL);
 	}
 	/* TODO: limits a la max_buf_aio et cetera */
-	if (vectored) {
+	if (rio_io_vectored(io)) {
 		resid = 0;
+		/* TODO: kiocb->rio_iov must be checked by copyin in a worker,
+		 * move to a bio worker pool and using copyinuio for temporary
+		 * kernel-copy of iovecs. */
 		for (int i = 0; i < kiocb->rio_length; i++) {
 			size_t len = kiocb->rio_iov[i].iov_len;
 
@@ -902,7 +1046,7 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 	pbp->bio_length = resid;
 	pbp->bio_caller1 = srcio;
 	pbp->bio_done = rio_bio_complete;
-	if (vectored) {
+	if (rio_io_vectored(io)) {
 		size_t nchildren = kiocb->rio_length;
 		struct bio **children;
 
@@ -945,87 +1089,98 @@ unref:
 	return (error);
 }
 
-static inline struct proc *
-rio_srcio_proc(struct rio_srcio *srcio)
+static inline int
+rio_io_foflag(struct rio_io *io)
 {
-	return (srcio->rs_sc->sc_proc);
+	return ((rio_io_flags(io) & RIO_FOFFSET) == 0 ? FOF_OFFSET : 0);
 }
 
-static inline void
-rio_srcio_vmspace_switch(struct rio_srcio *srcio, u_int id)
-{
-	rio_vmspace_switch(srcio->rs_sc->sc_vmspace, id);
-}
+/* Common context for blocking uio operations. */
+struct rio_uio {
+	struct uio	*ruio_uio;
+	struct uio	ruio__uio;
+	struct iovec	ruio__iov;
+	size_t		ruio_len;
+};
 
-static inline ssize_t
-rio_srcio_rw_common(struct rio_srcio *srcio, struct uio *uio, struct iovec *iov,
-    int *flagsp, u_int id)
+static inline int
+rio_uio_setup(struct rio_uio *ruio, struct rio_srcio *srcio, struct thread *td)
 {
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
-	size_t len;
-	u_int flags;
+	struct uio *uio;
+	struct iovec *iov;
+	int error;
 
-	rio_srcio_vmspace_switch(srcio, id);
-	/* TODO: special handling for devices/sockets */
-	/* TODO: put this all in a kaiocb for socket fo_aio_queue? */
-	uio->uio_td = curthread;
-	uio->uio_segflg = UIO_USERSPACE;
-	uio->uio_offset = kiocb->rio_offset;
-	flags = rio_io_flags(io);
-	if ((flags & RIO_VECTORED) == 0) {
+	if (rio_io_vectored(io)) {
+		error = copyinuio(kiocb->rio_iov, kiocb->rio_length, &uio);
+		if (error != 0) {
+			return (error);
+		}
+		srcio->rs_uio = uio; /* free after completion */
+	} else {
+		iov = &ruio->ruio__iov;
 		iov->iov_base = kiocb->rio_buf;
 		iov->iov_len = kiocb->rio_length;
+		uio = &ruio->ruio__uio;
 		uio->uio_iov = iov;
 		uio->uio_iovcnt = 1;
-	} else {
-		uio->uio_iov = kiocb->rio_iov;
-		uio->uio_iovcnt = kiocb->rio_length;
+		uio->uio_resid = kiocb->rio_length;
+		uio->uio_segflg = UIO_USERSPACE;
 	}
-	len = 0;
-	for (int i = 0; i < uio->uio_iovcnt; i++) {
-		len += uio->uio_iov[i].iov_len;
-	}
-	uio->uio_resid = len;
-	*flagsp = (flags & RIO_FOFFSET) == 0 ? FOF_OFFSET : 0;
-	return (len);
+	uio->uio_offset = kiocb->rio_offset;
+	uio->uio_td = td;
+	ruio->ruio_uio = uio;
+	ruio->ruio_len = uio->uio_resid;
+	return (0);
+}
+
+static inline ssize_t
+rio_uio_completed(struct rio_uio *ruio)
+{
+	return (ruio->ruio_len - ruio->ruio_uio->uio_resid);
 }
 
 static void
 rio_srcio_read(struct rio_srcio *srcio, u_int id)
 {
+	struct rio_uio ruio;
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
 	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
 	struct file *fp = io->rio_fd_file;
-	struct iovec iov;
-	struct uio uio;
-	ssize_t len;
-	int flags;
+	int error, foflag;
 
 	td->td_ucred = sc->sc_cred;
-	len = rio_srcio_rw_common(srcio, &uio, &iov, &flags, id);
-	uio.uio_rw = UIO_READ;
-	kiocb->rio_error = fo_read(fp, &uio, sc->sc_cred, flags, td);
+	rio_srcio_vmspace_switch(srcio, id);
+	if ((error = rio_uio_setup(&ruio, srcio, td)) != 0) {
+		rio_srcio_error(srcio, error);
+		return;
+	}
+	ruio.ruio_uio->uio_rw = UIO_READ;
+	foflag = rio_io_foflag(io);
+	kiocb->rio_error = fo_read(fp, ruio.ruio_uio, sc->sc_cred, foflag, td);
 	switch (kiocb->rio_error) {
 	case 0:
 	case ERESTART:
 	case EINTR:
 	case EWOULDBLOCK:
-		kiocb->rio_status = len - uio.uio_resid;
+		kiocb->rio_status = rio_uio_completed(&ruio);
 		break;
 	default:
 		kiocb->rio_status = -1;
 		break;
 	}
 	td->td_ucred = saved_cred;
+	rio_srcio_complete(srcio);
 }
 
 static void
 rio_srcio_write(struct rio_srcio *srcio, u_int id)
 {
+	struct rio_uio ruio;
 	struct proc *p = rio_srcio_proc(srcio);
 	struct thread *td = curthread;
 	struct ucred *saved_cred = td->td_ucred;
@@ -1033,18 +1188,20 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
 	struct file *fp = io->rio_fd_file;
-	struct iovec iov;
-	struct uio uio;
-	ssize_t len;
-	int flags;
+	int error, foflag;
 
 	td->td_ucred = sc->sc_cred;
-	len = rio_srcio_rw_common(srcio, &uio, &iov, &flags, id);
-	uio.uio_rw = UIO_WRITE;
+	rio_srcio_vmspace_switch(srcio, id);
+	if ((error = rio_uio_setup(&ruio, srcio, td)) != 0) {
+		rio_srcio_error(srcio, error);
+		return;
+	}
+	ruio.ruio_uio->uio_rw = UIO_WRITE;
+	foflag = rio_io_foflag(io);
 	if (fp->f_type == DTYPE_VNODE) {
 		bwillwrite();
 	}
-	kiocb->rio_error = fo_write(fp, &uio, sc->sc_cred, flags, td);
+	kiocb->rio_error = fo_write(fp, ruio.ruio_uio, sc->sc_cred, foflag, td);
 	switch (kiocb->rio_error) {
 	case EPIPE:
 		PROC_LOCK(p);
@@ -1055,13 +1212,14 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 	case ERESTART:
 	case EINTR:
 	case EWOULDBLOCK:
-		kiocb->rio_status = len - uio.uio_resid;
+		kiocb->rio_status = rio_uio_completed(&ruio);
 		break;
 	default:
 		kiocb->rio_status = -1;
 		break;
 	}
 	td->td_ucred = saved_cred;
+	rio_srcio_complete(srcio);
 }
 
 static void
@@ -1116,6 +1274,7 @@ rio_srcio_sync(struct rio_srcio *srcio, u_int id)
 		kiocb->rio_status = -1;
 	}
 	td->td_ucred = saved_cred;
+	rio_srcio_complete(srcio);
 }
 
 /*
@@ -1569,18 +1728,18 @@ rio_scheduler_destroy(struct rio_scheduler *sched)
 	rio_selector_destroy(&sched->rs_sel);
 }
 
+static inline bool
+riocb_canceled(struct riocb *iocb)
+{
+	return (atomic_load_int(&iocb->rio_error) == ECANCELED);
+}
+
 /* TODO: remote flow selection process */
 
 /* TODO: tuning */
 static u_int rio_attention_span = 1024;
 SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
     &rio_attention_span, 0, "Single-source I/O batch size");
-
-static inline bool
-riocb_canceled(struct riocb *iocb)
-{
-	return (atomic_load_int(&iocb->rio_error) == ECANCELED);
-}
 
 static void
 rio_issuer_thread(void *arg)
@@ -1632,16 +1791,14 @@ next:
 				uma_zfree(rio_src_zone, src);
 				goto next;
 			}
-			srcio = uma_zalloc(rio_srcio_zone, M_WAITOK);
-			srcio->rs_sc = sc;
-			srcio->rs_io = io = sc->sc_io + index;
-			kiocb = rio_io_kiocb(io);
-			memcpy(kiocb, iocb, sizeof(*iocb));
 			/* Check if canceled while in queue. */
 			if (__predict_false(riocb_canceled(iocb))) {
-				rio_srcio_error(srcio, ECANCELED);
+				rio_iocb_complete(sc, iocb, ECANCELED, -1);
 				continue;
 			}
+			io = sc->sc_io + index;
+			kiocb = rio_io_kiocb(io);
+			memcpy(kiocb, iocb, sizeof(*iocb));
 			fd = kiocb->rio_ident;
 			switch (rio_io_cmd(io)) {
 			case RIO_NOP:
@@ -1667,10 +1824,12 @@ next:
 				break;
 			}
 			if (__predict_false(error != 0)) {
-				rio_srcio_error(srcio, error);
+				rio_iocb_complete(sc, iocb, error, -1);
 				continue;
 			}
+			srcio = rio_srcio_new(sc, io);
 			/* Try the async BIO strategy if available. */
+			/* TODO: move to worker */
 			switch (rio_srcio_bio_strategy(srcio)) {
 			case 0:
 				continue;
@@ -1749,7 +1908,6 @@ rio_worker_proc(void *arg)
 		}
 		atomic_store_int(&iocb->rio_error, EINPROGRESS);
 		self->rw_handler(srcio, id);
-		rio_srcio_complete(srcio);
 	}
 	rio_vmspace_switch(myvm, id);
 	vmspace_free(myvm);
@@ -1852,6 +2010,8 @@ rio_load(void)
 
 	rio_src_zone = rio_zcreate("rio src", sizeof(struct rio_src));
 	rio_srcio_zone = rio_zcreate("rio src+io", sizeof(struct rio_srcio));
+	rio_srcio_ext_zone = rio_zcreate("rio src+io+extra",
+	    sizeof(struct rio_srcio_ext));
 
 	cv_init(&rio_shutdown_cond, "rio shutdown cond");
 
@@ -1945,6 +2105,7 @@ rio_shutdown(void)
 	taskqueue_free(rio_doom);
 	uma_zdestroy(rio_src_zone);
 	uma_zdestroy(rio_srcio_zone);
+	uma_zdestroy(rio_srcio_ext_zone);
 	cv_destroy(&rio_shutdown_cond);
 	return (0);
 }
