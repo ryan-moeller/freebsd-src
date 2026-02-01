@@ -314,7 +314,7 @@ ATF_TC_BODY(error_status, tc)
 	struct riocb iocb = {0};
 	int sd[2];
 	rio_t rio = NULL;
-	int cookie, error;
+	int cookie;
 
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE(socketpair(PF_LOCAL, SOCK_STREAM, 0, sd) != -1);
@@ -326,13 +326,18 @@ ATF_TC_BODY(error_status, tc)
 	/* Initially the error stays 0 while sitting in queues. */
 	ATF_CHECK(rio_error(rio, cookie) == 0);
 	ATF_CHECK(rio_submit(rio) != -1);
-	/* The error will still be 0 until a worker is about to do the I/O. */
-	/* XXX: Do not do this in a real program! */
-	while ((error = rio_error(rio, cookie)) == 0);
-	/* Now we're blocked in the kernel reading from the socket. */
-	ATF_CHECK_INTEQ(error, EINPROGRESS);
+	/*
+	 * The error will still be 0 until a worker is about to do the I/O.
+	 * For a socket, the control block remains queued on the socket buffer
+	 * until woken.  Only then will it be issued to a worker.
+	 */
+	ATF_CHECK_INTEQ(rio_error(rio, cookie), 0);
+#if 0 /* XXX: Can't reliably test this with a socketpair, it's non-blocking. */
+	/* Now we're blocked in the kernel waiting on the socket buffer. */
+	ATF_CHECK_INTEQ(rio_error(rio, cookie), EINPROGRESS);
 	/* Too late to cancel. */
 	ATF_CHECK_ERRNO(EINPROGRESS, rio_cancel(rio, cookie));
+#endif
 	/* Let it go. */
 	buf = 'R';
 	ATF_CHECK_INTEQ(write(sd[1], &buf, sizeof(buf)), sizeof(buf));

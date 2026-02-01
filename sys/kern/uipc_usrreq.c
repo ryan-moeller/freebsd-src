@@ -1110,7 +1110,7 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	struct uio *uio;
 	struct mchain mc, cmc;
 	size_t resid, sent;
-	bool nonblock, eor, aio;
+	bool nonblock, eor, aio, rio;
 	int error;
 
 	MPASS((uio0 != NULL && m == NULL) || (m != NULL && uio0 == NULL));
@@ -1126,7 +1126,7 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 	mc = MCHAIN_INITIALIZER(&mc);
 	cmc = MCHAIN_INITIALIZER(&cmc);
 	sent = 0;
-	aio = false;
+	aio = rio = false;
 
 	if (m == NULL) {
 		if (c != NULL && (error = unp_internalize(c, &cmc, td)))
@@ -1147,10 +1147,14 @@ uipc_sosend_stream_or_seqpacket(struct socket *so, struct sockaddr *addr,
 		 * the socket buffer, as aio(9) doesn't grab the I/O sx(9).
 		 * But syzkaller can create this mess.  For such false positive
 		 * our goal is just don't panic or leak memory.
+		 *
+		 * The same applies for rio(9).
 		 */
-		if (__predict_false(so->so_snd.sb_flags & SB_AIO_RUNNING)) {
+		if (__predict_false(so->so_snd.sb_flags &
+		    (SB_AIO_RUNNING | SB_RIO_RUNNING))) {
 			uio = cloneuio(uio0);
-			aio = true;
+			aio = (so->so_snd.sb_flags & SB_AIO_RUNNING) != 0;
+			rio = (so->so_snd.sb_flags & SB_RIO_RUNNING) != 0;
 		} else {
 			uio = uio0;
 			resid = uio->uio_resid;
@@ -1223,8 +1227,10 @@ restart:
 			if (nonblock) {
 				if (aio)
 					sb->uxst_flags |= UXST_PEER_AIO;
+				if (rio)
+					sb->uxst_flags |= UXST_PEER_RIO;
 				SOCK_RECVBUF_UNLOCK(so2);
-				if (aio) {
+				if (aio || rio) {
 					SOCK_SENDBUF_LOCK(so);
 					so->so_snd.sb_ccc =
 					    so->so_snd.sb_hiwat - space;
@@ -1317,7 +1323,7 @@ out4:
 out3:
 	SOCK_IO_SEND_UNLOCK(so);
 out2:
-	if (aio) {
+	if (aio || rio) {
 		freeuio(uio);
 		uioadvance(uio0, sent);
 	} else if (uio != NULL)
@@ -1521,10 +1527,12 @@ restart:
 		UIPC_STREAM_SBCHECK(sb);
 		if (__predict_true(sb->uxst_peer != NULL)) {
 			struct unpcb *unp2;
-			bool aio;
+			bool aio, rio;
 
 			if ((aio = sb->uxst_flags & UXST_PEER_AIO))
 				sb->uxst_flags &= ~UXST_PEER_AIO;
+			if ((rio = sb->uxst_flags & UXST_PEER_RIO))
+				sb->uxst_flags &= ~UXST_PEER_RIO;
 
 			uipc_wakeup_writer(so);
 			/*
@@ -1533,12 +1541,15 @@ restart:
 			 * us from unp_soisdisconnected().  The aio workarounds
 			 * should be refactored to the aio(4) side.
 			 */
-			if (aio && uipc_lock_peer(so, &unp2) == 0) {
+			if ((aio || rio) && uipc_lock_peer(so, &unp2) == 0) {
 				struct socket *so2 = unp2->unp_socket;
 
 				SOCK_SENDBUF_LOCK(so2);
 				so2->so_snd.sb_ccc -= datalen;
-				sowakeup_aio(so2, SO_SND);
+				if (aio)
+					sowakeup_aio(so2, SO_SND);
+				if (rio)
+					sowakeup_rio(so2, SO_SND);
 				SOCK_SENDBUF_UNLOCK(so2);
 				UNP_PCB_UNLOCK(unp2);
 			}

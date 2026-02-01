@@ -865,6 +865,10 @@ soalloc(struct vnet *vnet)
 	TAILQ_INIT(&so->so_rcv.sb_aiojobq);
 	TASK_INIT(&so->so_snd.sb_aiotask, 0, soaio_snd, so);
 	TASK_INIT(&so->so_rcv.sb_aiotask, 0, soaio_rcv, so);
+	STAILQ_INIT(&so->so_snd.sb_riosrcios);
+	STAILQ_INIT(&so->so_rcv.sb_riosrcios);
+	TASK_INIT(&so->so_snd.sb_riotask, 0, sorio_snd, so);
+	TASK_INIT(&so->so_rcv.sb_riotask, 0, sorio_rcv, so);
 #ifdef VIMAGE
 	VNET_ASSERT(vnet != NULL, ("%s:%d vnet is NULL, so=%p",
 	    __func__, __LINE__, so));
@@ -1478,6 +1482,7 @@ solisten_proto_check(struct socket *so)
 
 	/* Interlock with soo_aio_queue() and KTLS. */
 	if (!SOLISTENING(so)) {
+		short async_flags = SB_AIO | SB_AIO_RUNNING | SB_RIO_RUNNING;
 		bool ktls;
 
 #ifdef KERN_TLS
@@ -1487,8 +1492,9 @@ solisten_proto_check(struct socket *so)
 		ktls = false;
 #endif
 		if (ktls ||
-		    (so->so_snd.sb_flags & (SB_AIO | SB_AIO_RUNNING)) != 0 ||
-		    (so->so_rcv.sb_flags & (SB_AIO | SB_AIO_RUNNING)) != 0) {
+		    (so->so_snd.sb_flags & async_flags) != 0 ||
+		    (so->so_rcv.sb_flags & async_flags) != 0 ||
+		    sbrioqueued(&so->so_snd) || sbrioqueued(&so->so_rcv)) {
 			solisten_proto_abort(so);
 			return (EINVAL);
 		}
