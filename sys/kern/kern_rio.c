@@ -27,6 +27,7 @@
 #include <sys/pcpu.h>
 #include <sys/proc.h>
 #include <sys/protosw.h>
+#include <sys/ptrace.h>
 #include <sys/queue.h>
 #include <sys/rio.h>
 #include <sys/sched.h>
@@ -1025,21 +1026,26 @@ rio_bio_complete(struct bio *bp)
 	rio_srcio_complete(srcio);
 }
 
+#define RIO_EFALLBACK -1
+
 static inline int
 rio_srcio_bio_strategy(struct rio_srcio *srcio)
 {
+	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
-	vm_map_t map = &srcio->rs_sc->sc_vmspace->vm_map;
+	struct proc *p = sc->sc_proc;
+	vm_map_t map = &sc->sc_vmspace->vm_map;
 	struct file *fp = io->rio_fd_file;
 	struct vnode *vp = fp->f_vnode;
 	struct cdevsw *csw;
 	struct cdev *dev;
 	struct bio *pbp;
+	struct iovec *iov = NULL;
+	size_t iovcnt, resid;
 	off_t offset = kiocb->rio_offset;
-	size_t resid;
 	u_int cmd = rio_io_cmd(io);
-	int bsize, bio_cmd, error, ref = 0;
+	int bsize, maxio, bio_cmd, error, ref = 0;
 
 	switch (cmd) {
 	case RIO_READ:
@@ -1050,44 +1056,76 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 		break;
 	/* TODO: BIO_DELETE? BIO_FLUSH? */
 	default:
-		return (EINVAL);
+		return (RIO_EFALLBACK);
 	}
 	if (fp == NULL || fp->f_type != DTYPE_VNODE) {
-		return (EINVAL);
+		return (RIO_EFALLBACK);
 	}
 	if (vp->v_type != VCHR || (bsize = vp->v_bufobj.bo_bsize) == 0) {
-		return (EINVAL);
-	}
-	/* TODO: limits a la max_buf_aio et cetera */
-	if (rio_io_vectored(io)) {
-		resid = 0;
-		/* TODO: kiocb->rio_iov must be checked by copyin in a worker,
-		 * move to a bio worker pool and using copyinuio for temporary
-		 * kernel-copy of iovecs. */
-		for (int i = 0; i < kiocb->rio_length; i++) {
-			size_t len = kiocb->rio_iov[i].iov_len;
-
-			if (len % bsize != 0 || len > maxphys) {
-				return (EINVAL);
-			}
-			resid += len;
-		}
-	} else {
-		resid = kiocb->rio_length;
-		if (resid % bsize != 0 || resid > maxphys) {
-			return (EINVAL);
-		}
+		return (RIO_EFALLBACK);
 	}
 	if ((csw = devvn_refthread(vp, &dev, &ref)) == NULL) {
 		return (ENXIO);
 	}
 	if ((csw->d_flags & D_DISK) == 0) {
-		error = EINVAL;
+		error = RIO_EFALLBACK;
 		goto unref;
 	}
-	if (resid > dev->si_iosize_max) {
-		error = EINVAL;
+	iovcnt = rio_io_vectored(io) ? kiocb->rio_length : 1;
+	if ((dev->si_flags & SI_NOSPLIT) != 0 && iovcnt > 1) {
+		error = RIO_EFALLBACK;
 		goto unref;
+	}
+	if (__predict_false((maxio = dev->si_iosize_max) < PAGE_SIZE)) {
+		printf("WARNING: %s si_iosize_max=%d, using DFLTPHYS.\n",
+		    devtoname(dev), maxio);
+		maxio = DFLTPHYS;
+	}
+	maxio = MIN(maxio, maxphys);
+	/* TODO: limits a la max_buf_aio et cetera */
+	if (rio_io_vectored(io)) {
+		ssize_t iovsize, result;
+
+		iov = mallocarray(iovcnt, sizeof(*iov), M_IOV, M_WAITOK);
+		/*
+		 * Avoid pushing this down to a worker for copyiniov vmspace.
+		 * proc_readmem will validate the rio_iov pointer in the user's
+		 * vmspace and do the vm song and dance to copy in the iovecs.
+		 * Pushing this down to a worker would complicate fallback to
+		 * regular file I/O in case of error.
+		 *
+		 * What kind of error might occur that would not also occur in
+		 * the fallback path?  This fast path requires buffer lengths
+		 * to be a multiple of the vnode buffer size and less than the
+		 * device max iosize, whereas the fallback through physio will
+		 * make adjustments to the I/O requests to fit the device's
+		 * constraints.
+		 */
+		iovsize = iovcnt * sizeof(*iov);
+		PHOLD(p);
+		result = proc_readmem(curthread, p, (vm_offset_t)kiocb->rio_iov,
+		    iov, iovsize);
+		PRELE(p);
+		if (__predict_false(result != iovsize)) {
+			error = EFAULT;
+			goto free;
+		}
+		resid = 0;
+		for (int i = 0; i < iovcnt; i++) {
+			size_t len = iov[i].iov_len;
+
+			if (len % bsize != 0 || len > maxio) {
+				error = RIO_EFALLBACK;
+				goto free;
+			}
+			resid += len;
+		}
+	} else {
+		resid = kiocb->rio_length;
+		if (resid % bsize != 0 || resid > maxio) {
+			error = RIO_EFALLBACK;
+			goto free;
+		}
 	}
 	/* TODO: buffer count limits a la aio */
 	pbp = g_alloc_bio();
@@ -1097,29 +1135,27 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 	pbp->bio_caller1 = srcio;
 	pbp->bio_done = rio_bio_complete;
 	if (rio_io_vectored(io)) {
-		size_t nchildren = kiocb->rio_length;
 		struct bio **children;
 
-		children = mallocarray(nchildren, sizeof(*children), M_TEMP,
+		children = mallocarray(iovcnt, sizeof(*children), M_TEMP,
 		    M_WAITOK | M_ZERO);
-		for (int i = 0; i < nchildren; i++) {
-			struct iovec *iov = kiocb->rio_iov + i;
+		for (int i = 0; i < iovcnt; i++) {
 			struct bio *bp = g_duplicate_bio(pbp);
 
 			children[i] = bp;
 			bp->bio_offset = offset;
 			bp->bio_done = rio_bio_childdone;
 			if ((error = rio_bio_bufsetup(bp, dev, map,
-			    iov->iov_base, iov->iov_len)) != 0) {
+			    iov[i].iov_base, iov[i].iov_len)) != 0) {
 				do {
 					rio_bio_destroy(children[i]);
 				} while (i-- > 0);
 				free(children, M_TEMP);
 				goto destroy;
 			}
-			offset += iov->iov_len;
+			offset += iov[i].iov_len;
 		}
-		for (int i = 0; i < nchildren; i++) {
+		for (int i = 0; i < iovcnt; i++) {
 			csw->d_strategy(children[i]);
 		}
 		free(children, M_TEMP);
@@ -1130,10 +1166,13 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 		}
 		csw->d_strategy(pbp);
 	}
+	free(iov, M_IOV);
 	dev_relthread(dev, ref);
 	return (0);
 destroy:
 	g_destroy_bio(pbp);
+free:
+	free(iov, M_IOV);
 unref:
 	dev_relthread(dev, ref);
 	return (error);
@@ -2249,21 +2288,21 @@ next:
 				continue;
 			}
 			srcio = rio_srcio_new(sc, io);
-			/* Try the async BIO strategy if available. */
-			/* TODO: move to worker */
-			switch (rio_srcio_bio_strategy(srcio)) {
-			case 0:
-				continue;
-			case ENXIO:
-				rio_srcio_error(srcio, ENXIO);
-				continue;
-			default:
-				break;
-			}
 			/* Handle sockets with non-blocking operations. */
 			if (rio_srcio_socket_enqueue(srcio)) {
 				continue;
 			}
+			/* Try the async BIO strategy if available. */
+			switch ((error = rio_srcio_bio_strategy(srcio))) {
+			case 0:
+				continue;
+			case RIO_EFALLBACK:
+				break;
+			default:
+				rio_srcio_error(srcio, error);
+				continue;
+			}
+			/* Issue to a worker. */
 			rio_scheduler_schedule(&sched, srcio);
 		}
 		sx_sunlock(&sc->sc_status_lock);
@@ -2296,7 +2335,12 @@ rio_worker_proc(void *arg)
 		enum rio_status status;
 		int error;
 
-		/* TODO: Work stealing! */
+		/* TODO: Work stealing!
+		 * Why not have one queue per worker class in each flow, and
+		 * have workers take from there instead of each having its own
+		 * queue?  Separate queues gives us control over which worker we
+		 * schedule I/O on, which is how vmspace affinity is achieved.
+		 */
 		if ((error = rio_worker_dequeue(self, &srcio)) == ESHUTDOWN) {
 			break;
 		}
