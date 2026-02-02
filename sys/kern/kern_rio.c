@@ -1187,9 +1187,10 @@ rio_io_foflag(struct rio_io *io)
 /* Common context for blocking uio operations. */
 struct rio_uio {
 	struct uio	*ruio_uio;
+	size_t		ruio_len;
+	/* internal storage */
 	struct uio	ruio__uio;
 	struct iovec	ruio__iov;
-	size_t		ruio_len;
 };
 
 static inline int
