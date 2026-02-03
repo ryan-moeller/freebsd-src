@@ -676,12 +676,18 @@ rio_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
 }
 
 struct rio_src {
-	struct rio_softc	*rs_sc;	/* io source context */
+	struct rio_softc	*rs_sc;		/* io source context */
+	u_int			rs_attention;	/* issuer credits */
 	STAILQ_ENTRY(rio_src)	rs_srcs;
 };
 STAILQ_HEAD(rio_srcs, rio_src);
 
 static uma_zone_t rio_src_zone;
+
+/* TODO: tuning, policy */
+static u_int rio_attention_span = 1024;
+SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
+    &rio_attention_span, 0, "Single-source I/O batch size");
 
 /*
  * A RIO issuer is a queue of IO request sources serviced by a collection of
@@ -704,9 +710,28 @@ rio_issuer_enqueue(struct rio_issuer *issuer, struct rio_src *src)
 {
 	bool wake;
 
+	/* Refill attention credits when enqueued to the back. */
+	src->rs_attention = rio_attention_span;
 	mtx_lock(&issuer->ri_lock);
 	wake = STAILQ_EMPTY(&issuer->ri_srcs);
 	STAILQ_INSERT_TAIL(&issuer->ri_srcs, src, rs_srcs);
+	issuer->ri_len++;
+	if (wake) {
+		cv_signal(&issuer->ri_cond);
+	}
+	mtx_unlock(&issuer->ri_lock);
+}
+
+static inline void
+rio_issuer_enqueue_front(struct rio_issuer *issuer, struct rio_src *src)
+{
+	bool wake;
+
+	/* Keep existing credits when enqueued to the front. */
+	src->rs_attention = src->rs_attention;
+	mtx_lock(&issuer->ri_lock);
+	wake = STAILQ_EMPTY(&issuer->ri_srcs);
+	STAILQ_INSERT_HEAD(&issuer->ri_srcs, src, rs_srcs);
 	issuer->ri_len++;
 	if (wake) {
 		cv_signal(&issuer->ri_cond);
@@ -1026,64 +1051,95 @@ rio_bio_complete(struct bio *bp)
 	rio_srcio_complete(srcio);
 }
 
-#define RIO_EFALLBACK -1
+/* context for cdev bio ops */
+struct rio_cdev {
+	struct cdevsw	*rcd_csw;
+	struct cdev	*rcd_dev;
+	int		rcd_ref;
+	int		rcd_cmd;
+	int		rcd_bsize;
+	int		rcd_maxio;
+	size_t		rcd_iovcnt;
+};
+
+static inline void
+rio_cdev_unref(struct rio_cdev *rcd)
+{
+	dev_relthread(rcd->rcd_dev, rcd->rcd_ref);
+}
+
+/* special return code for rio_cdev_setup */
+#define RIO_CDEV_FALLBACK -1
 
 static inline int
-rio_srcio_bio_strategy(struct rio_srcio *srcio)
+rio_cdev_setup(struct rio_cdev *rcd, struct rio_srcio *srcio)
 {
-	struct rio_softc *sc = srcio->rs_sc;
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
-	struct proc *p = sc->sc_proc;
-	vm_map_t map = &sc->sc_vmspace->vm_map;
 	struct file *fp = io->rio_fd_file;
-	struct vnode *vp = fp->f_vnode;
+	struct vnode *vp;
 	struct cdevsw *csw;
 	struct cdev *dev;
-	struct bio *pbp;
-	struct iovec *iov = NULL;
-	size_t iovcnt, resid;
-	off_t offset = kiocb->rio_offset;
-	u_int cmd = rio_io_cmd(io);
-	int bsize, maxio, bio_cmd, error, ref = 0;
+	int maxio;
 
-	switch (cmd) {
+	switch (rio_io_cmd(io)) {
 	case RIO_READ:
-		bio_cmd = BIO_READ;
+		rcd->rcd_cmd = BIO_READ;
 		break;
 	case RIO_WRITE:
-		bio_cmd = BIO_WRITE;
+		rcd->rcd_cmd = BIO_WRITE;
 		break;
 	/* TODO: BIO_DELETE? BIO_FLUSH? */
 	default:
-		return (RIO_EFALLBACK);
+		return (RIO_CDEV_FALLBACK);
 	}
 	if (fp == NULL || fp->f_type != DTYPE_VNODE) {
-		return (RIO_EFALLBACK);
+		return (RIO_CDEV_FALLBACK);
 	}
-	if (vp->v_type != VCHR || (bsize = vp->v_bufobj.bo_bsize) == 0) {
-		return (RIO_EFALLBACK);
+	vp = fp->f_vnode;
+	rcd->rcd_bsize = vp->v_bufobj.bo_bsize;
+	if (vp->v_type != VCHR || rcd->rcd_bsize == 0) {
+		return (RIO_CDEV_FALLBACK);
 	}
-	if ((csw = devvn_refthread(vp, &dev, &ref)) == NULL) {
+	if ((csw = devvn_refthread(vp, &dev, &rcd->rcd_ref)) == NULL) {
 		return (ENXIO);
 	}
+	rcd->rcd_csw = csw;
+	rcd->rcd_dev = dev;
 	if ((csw->d_flags & D_DISK) == 0) {
-		error = RIO_EFALLBACK;
-		goto unref;
+		rio_cdev_unref(rcd);
+		return (RIO_CDEV_FALLBACK);
 	}
-	iovcnt = rio_io_vectored(io) ? kiocb->rio_length : 1;
-	if ((dev->si_flags & SI_NOSPLIT) != 0 && iovcnt > 1) {
-		error = RIO_EFALLBACK;
-		goto unref;
+	rcd->rcd_iovcnt = rio_io_vectored(io) ? kiocb->rio_length : 0;
+	if ((dev->si_flags & SI_NOSPLIT) != 0 && rcd->rcd_iovcnt > 1) {
+		rio_cdev_unref(rcd);
+		return (RIO_CDEV_FALLBACK);
 	}
 	if (__predict_false((maxio = dev->si_iosize_max) < PAGE_SIZE)) {
 		printf("WARNING: %s si_iosize_max=%d, using DFLTPHYS.\n",
 		    devtoname(dev), maxio);
 		maxio = DFLTPHYS;
 	}
-	maxio = MIN(maxio, maxphys);
+	rcd->rcd_maxio = MIN(maxio, maxphys);
 	/* TODO: limits a la max_buf_aio et cetera */
-	if (rio_io_vectored(io)) {
+	return (0);
+}
+
+static inline int
+rio_cdev_bio_strategy(struct rio_cdev *rcd, struct rio_srcio *srcio)
+{
+	struct rio_softc *sc = srcio->rs_sc;
+	struct rio_io *io = srcio->rs_io;
+	struct riocb *kiocb = rio_io_kiocb(io);
+	struct proc *p = sc->sc_proc;
+	vm_map_t map = &sc->sc_vmspace->vm_map;
+	struct iovec *iov = NULL;
+	struct bio *pbp;
+	size_t resid, iovcnt = rcd->rcd_iovcnt;
+	off_t offset = kiocb->rio_offset;
+	int error;
+
+	if (iovcnt > 0) {
 		ssize_t iovsize, result;
 
 		iov = mallocarray(iovcnt, sizeof(*iov), M_IOV, M_WAITOK);
@@ -1114,27 +1170,27 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 		for (int i = 0; i < iovcnt; i++) {
 			size_t len = iov[i].iov_len;
 
-			if (len % bsize != 0 || len > maxio) {
-				error = RIO_EFALLBACK;
+			if (len % rcd->rcd_bsize != 0 || len > rcd->rcd_maxio) {
+				error = RIO_CDEV_FALLBACK;
 				goto free;
 			}
 			resid += len;
 		}
 	} else {
 		resid = kiocb->rio_length;
-		if (resid % bsize != 0 || resid > maxio) {
-			error = RIO_EFALLBACK;
+		if (resid % rcd->rcd_bsize != 0 || resid > rcd->rcd_maxio) {
+			error = RIO_CDEV_FALLBACK;
 			goto free;
 		}
 	}
 	/* TODO: buffer count limits a la aio */
 	pbp = g_alloc_bio();
-	pbp->bio_cmd = bio_cmd;
+	pbp->bio_cmd = rcd->rcd_cmd;
 	pbp->bio_offset = offset;
 	pbp->bio_length = resid;
 	pbp->bio_caller1 = srcio;
 	pbp->bio_done = rio_bio_complete;
-	if (rio_io_vectored(io)) {
+	if (iovcnt > 0) {
 		struct bio **children;
 
 		children = mallocarray(iovcnt, sizeof(*children), M_TEMP,
@@ -1145,7 +1201,7 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 			children[i] = bp;
 			bp->bio_offset = offset;
 			bp->bio_done = rio_bio_childdone;
-			if ((error = rio_bio_bufsetup(bp, dev, map,
+			if ((error = rio_bio_bufsetup(bp, rcd->rcd_dev, map,
 			    iov[i].iov_base, iov[i].iov_len)) != 0) {
 				do {
 					rio_bio_destroy(children[i]);
@@ -1156,25 +1212,24 @@ rio_srcio_bio_strategy(struct rio_srcio *srcio)
 			offset += iov[i].iov_len;
 		}
 		for (int i = 0; i < iovcnt; i++) {
-			csw->d_strategy(children[i]);
+			rcd->rcd_csw->d_strategy(children[i]);
 		}
 		free(children, M_TEMP);
 	} else {
-		if ((error = rio_bio_bufsetup(pbp, dev, map, kiocb->rio_buf,
-		    kiocb->rio_length)) != 0) {
+		if ((error = rio_bio_bufsetup(pbp, rcd->rcd_dev, map,
+		    kiocb->rio_buf, kiocb->rio_length)) != 0) {
 			goto destroy;
 		}
-		csw->d_strategy(pbp);
+		rcd->rcd_csw->d_strategy(pbp);
 	}
 	free(iov, M_IOV);
-	dev_relthread(dev, ref);
+	rio_cdev_unref(rcd);
 	return (0);
 destroy:
 	g_destroy_bio(pbp);
 free:
 	free(iov, M_IOV);
-unref:
-	dev_relthread(dev, ref);
+	rio_cdev_unref(rcd);
 	return (error);
 }
 
@@ -1958,7 +2013,7 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
  * minimize latency and maximize throughput.  Optimizing the balance of these
  * priorities is the role of the policy.
  *
- * TODO: Flow vnet affinity.
+ * TODO: Utilize flow vnet affinity.
  */
 struct rio_scheduler {
 	struct rio_selector	rs_sel;
@@ -2197,11 +2252,6 @@ sorio_rcv(void *context, int pending __unused)
 	rio_socket_schedule(context, SO_RCV);
 }
 
-/* TODO: tuning */
-static u_int rio_attention_span = 1024;
-SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
-    &rio_attention_span, 0, "Single-source I/O batch size");
-
 static void
 rio_issuer_thread(void *arg)
 {
@@ -2218,7 +2268,6 @@ rio_issuer_thread(void *arg)
 		struct rio_src *src;
 		struct rio_softc *sc;
 		struct thread *td;
-		size_t issued;
 next:
 		/* TODO: Removal reduces concurrency!  Add an issuing list? */
 		/* TODO: Work stealing! */
@@ -2238,8 +2287,8 @@ next:
 		}
 		td = FIRST_THREAD_IN_PROC(sc->sc_proc);
 
-		/* TODO: Policy-based attention span. */
-		for (issued = 0; issued < rio_attention_span; issued++) {
+		while (src->rs_attention-- > 0) {
+			struct rio_cdev rcd;
 			struct rio_srcio *srcio;
 			struct rio_io *io;
 			struct riocb *iocb, *kiocb;
@@ -2294,16 +2343,43 @@ next:
 				continue;
 			}
 			/* Try the async BIO strategy if available. */
-			switch ((error = rio_srcio_bio_strategy(srcio))) {
+			switch ((error = rio_cdev_setup(&rcd, srcio))) {
+			case RIO_CDEV_FALLBACK:
+				goto schedule;
 			case 0:
-				continue;
-			case RIO_EFALLBACK:
+				if (rcd.rcd_iovcnt > 0) {
+					/*
+					 * Reading iovecs may sleep, so we
+					 * requeue src to the front of the
+					 * issuer queue for another thread to
+					 * service.
+					 */
+					rio_issuer_enqueue_front(self, src);
+				}
 				break;
 			default:
 				rio_srcio_error(srcio, error);
 				continue;
 			}
-			/* Issue to a worker. */
+			switch ((error = rio_cdev_bio_strategy(&rcd, srcio))) {
+			case RIO_CDEV_FALLBACK:
+				goto schedule;
+			default:
+				rio_srcio_error(srcio, error);
+				/* FALLTHROUGH */
+			case 0:
+				if (rcd.rcd_iovcnt > 0) {
+					/*
+					 * The src was requeued on the issuer.
+					 * Unlock it and go next.
+					 */
+					sx_sunlock(&sc->sc_status_lock);
+					goto next;
+				}
+				continue;
+			}
+schedule:
+			/* Schedule the io on a worker. */
 			rio_scheduler_schedule(&sched, srcio);
 		}
 		sx_sunlock(&sc->sc_status_lock);
