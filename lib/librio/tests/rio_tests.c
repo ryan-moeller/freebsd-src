@@ -5,10 +5,15 @@
  */
 
 #include <sys/param.h>
+#include <sys/mdioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <paths.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -352,6 +357,151 @@ ATF_TC_BODY(error_status, tc)
 	rio_destroy(rio);
 }
 
+#define MDUNIT_LINK	"mdunit_link"
+
+static int
+md_setup(void)
+{
+	char buf[PATH_MAX];
+	struct md_ioctl mdio;
+	int fd;
+
+	fd = open(_PATH_DEV MDCTL_NAME, O_RDWR, 0);
+	ATF_REQUIRE_MSG(fd != -1,
+	    "opening %s%s failed: %s", _PATH_DEV, MDCTL_NAME,
+	    strerror(errno));
+
+	memset(&mdio, 0, sizeof(mdio));
+	mdio.md_version = MDIOVERSION;
+	mdio.md_type = MD_MALLOC;
+	mdio.md_options = MD_AUTOUNIT | MD_COMPRESS;
+	mdio.md_mediasize = 1 << 20; /* 1 MiB */
+	mdio.md_sectorsize = 512;
+	strlcpy(buf, __func__, sizeof(buf));
+	mdio.md_label = buf;
+
+	ATF_REQUIRE_MSG(ioctl(fd, MDIOCATTACH, &mdio) != -1,
+	    "ioctl MDIOCATTACH failed: %s", strerror(errno));
+	close(fd);
+
+	snprintf(buf, sizeof(buf), "%d", mdio.md_unit);
+	ATF_REQUIRE_MSG(symlink(buf, MDUNIT_LINK) != -1,
+	    "symlink %s failed: %s", buf, strerror(errno));
+	snprintf(buf, sizeof(buf), _PATH_DEV MD_NAME "%d", mdio.md_unit);
+	fd = open(buf, O_RDWR);
+	ATF_REQUIRE_MSG(fd != -1,
+	    "opening %s failed: %s", buf, strerror(errno));
+
+	return (fd);
+}
+
+static void
+md_cleanup(void)
+{
+	char buf[PATH_MAX];
+	struct md_ioctl mdio;
+	int fd, n;
+
+	fd = open(_PATH_DEV MDCTL_NAME, O_RDWR, 0);
+	if (fd == -1) {
+		fprintf(stderr, "opening %s%s failed: %s\n", _PATH_DEV,
+		    MDCTL_NAME, strerror(errno));
+		return;
+	}
+	n = readlink(MDUNIT_LINK, buf, sizeof(buf) - 1);
+	if (n > 0) {
+		buf[n] = '\0';
+		memset(&mdio, 0, sizeof(mdio));
+		if (sscanf(buf, "%d", &mdio.md_unit) > 0 && mdio.md_unit >= 0) {
+			mdio.md_version = MDIOVERSION;
+			if (ioctl(fd, MDIOCDETACH, &mdio) == -1) {
+				fprintf(stderr,
+				    "ioctl MDIOCDETACH unit %d failed: %s\n",
+				    mdio.md_unit, strerror(errno));
+			}
+		}
+	}
+	close(fd);
+}
+
+static inline void
+fill_buffer(char *buf, size_t len, long seed)
+{
+	srandom(seed);
+	for (u_int i = 0; i < len; i++) {
+		buf[i] = random() & 0xff;
+	}
+}
+
+static inline bool
+test_buffer(char *buf, size_t len, long seed)
+{
+	srandom(seed);
+	for (u_int i = 0; i < len; i++) {
+		char c = random() & 0xff;
+
+		if (buf[i] != c) {
+			fprintf(stderr, "%c != %c\n", buf[i], c);
+			return (false);
+		}
+	}
+	return (true);
+}
+
+ATF_TC_WITH_CLEANUP(cdev);
+ATF_TC_HEAD(cdev, tc)
+{
+	atf_tc_set_md_var(tc, "descr", "Tests cdev bio issuing");
+	atf_tc_set_md_var(tc, "require.user", "root");
+	atf_tc_set_md_var(tc, "require.kmods", "g_md");
+}
+
+ATF_TC_BODY(cdev, tc)
+{
+	char buf[16384];
+	rio_t rio;
+	struct riocb iocb;
+	struct iovec iov;
+	long seed;
+
+	srandomdev();
+	seed = random();
+	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
+	iocb.rio_ident = md_setup();
+	iocb.rio_offset = 0;
+	iocb.rio_buf = buf;
+	iocb.rio_length = sizeof(buf);
+	fill_buffer(buf, sizeof(buf), seed);
+	ATF_REQUIRE_MSG(rio_write(rio, &iocb, NULL) != -1,
+	    "rio_write failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(rio_submit(rio) != -1,
+	    "rio_submit failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(rio_poll(rio, &iocb, NULL) != -1,
+	    "rio_poll failed: %s", strerror(errno));
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
+	iocb.rio_iov = &iov;
+	iocb.rio_length = 1;
+	ATF_REQUIRE_MSG(rio_readv(rio, &iocb, NULL) != -1,
+	    "rio_readv failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(rio_submit(rio) != -1,
+	    "rio_submit failed: %s", strerror(errno));
+	ATF_REQUIRE_MSG(rio_poll(rio, &iocb, NULL) != -1,
+	    "rio_poll failed: %s", strerror(errno));
+	ATF_REQUIRE_INTEQ(iocb.rio_error, 0);
+	ATF_REQUIRE_INTEQ(iocb.rio_status, sizeof(buf));
+	/* buffer check */
+	ATF_REQUIRE(test_buffer(buf, sizeof(buf), seed));
+
+	close(iocb.rio_ident);
+	rio_destroy(rio);
+}
+
+ATF_TC_CLEANUP(cdev, tc)
+{
+	md_cleanup();
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, create_destroy);
@@ -361,5 +511,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, saturation);
 	ATF_TP_ADD_TC(tp, cancel);
 	ATF_TP_ADD_TC(tp, error_status);
+	ATF_TP_ADD_TC(tp, cdev);
 	return (atf_no_error());
 }
