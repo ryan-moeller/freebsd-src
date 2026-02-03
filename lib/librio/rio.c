@@ -324,7 +324,8 @@ rio_error(rio_t rio, uint32_t index)
 	struct riocb *riocb;
 
 	if (index >= rio->rio_ncb) {
-		return (EINVAL);
+		errno = EINVAL;
+		return (-1);
 	}
 	riocb = rio->rio_mapped->rio_control + index;
 	return (ck_pr_load_int(&riocb->rio_error));
