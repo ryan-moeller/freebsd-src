@@ -148,15 +148,7 @@ static struct mtx rio_shutdown_lock;
 MTX_SYSINIT(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
     MTX_DEF);
 static struct cv rio_shutdown_cond;
-static boolean_t rio_shutdown_pending;
-_Static_assert(sizeof(rio_shutdown_pending) == sizeof(int),
-    "rio_shutdown_pending must be int-sized for atomic use");
-
-static inline bool
-rio_shuttingdown(void)
-{
-	return (atomic_load_acq_int(&rio_shutdown_pending));
-}
+static bool rio_shutdown_pending;
 
 /* size of riopriv bitset */
 static u_int rio_max_workers = PAGE_SIZE * NBBY;
@@ -307,7 +299,7 @@ rio_open(struct rio_softc **scp)
 
 	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
 	mtx_lock(&rio_shutdown_lock);
-	if (rio_shuttingdown()) {
+	if (rio_shutdown_pending) {
 		mtx_unlock(&rio_shutdown_lock);
 		free(sc, M_RIO);
 		return (ESHUTDOWN);
@@ -327,7 +319,7 @@ rio_close(struct rio_softc *sc)
 	mtx_lock(&rio_shutdown_lock);
 	LIST_REMOVE(sc, sc_handles);
 	rio_open_count--;
-	if (rio_open_count == 0 && rio_shuttingdown()) {
+	if (rio_open_count == 0 && rio_shutdown_pending) {
 		cv_signal(&rio_shutdown_cond);
 	}
 	mtx_unlock(&rio_shutdown_lock);
@@ -748,7 +740,7 @@ rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
 	while (STAILQ_EMPTY(&issuer->ri_srcs)) {
 		/* TODO: timeout for autoscaling */
 		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
-		if (__predict_false(rio_shuttingdown())) {
+		if (__predict_false(issuer->ri_shutdown)) {
 			mtx_unlock(&issuer->ri_lock);
 			return (ESHUTDOWN);
 		}
@@ -1728,6 +1720,7 @@ struct rio_worker {
 	u_int			rw_cpu;
 	u_int			rw_id;
 	bool			rw_done;
+	bool			rw_shutdown;
 };
 
 static inline void
@@ -1755,7 +1748,7 @@ rio_worker_dequeue(struct rio_worker *worker, struct rio_srcio **srciop)
 		/* TODO: timeout for autoscaling */
 		cv_wait(&worker->rw_cond, &worker->rw_lock);
 	}
-	if (__predict_false(rio_shuttingdown())) {
+	if (__predict_false(worker->rw_shutdown)) {
 		mtx_unlock(&worker->rw_lock);
 		return (ESHUTDOWN);
 	}
@@ -2601,9 +2594,38 @@ rio_load(void)
 }
 
 static inline void
+rio_issuer_shutdown(struct rio_issuer *issuer)
+{
+	mtx_lock(&issuer->ri_lock);
+	issuer->ri_shutdown = true;
+	mtx_unlock(&issuer->ri_lock);
+}
+
+static inline void
+rio_worker_shutdown(struct rio_worker *worker)
+{
+	mtx_lock(&worker->rw_lock);
+	worker->rw_shutdown = true;
+	mtx_unlock(&worker->rw_lock);
+}
+
+static inline void
+rio_workerclass_shutdown_(struct rio_worker *workers, u_int n)
+{
+	for (u_int i = 0; i < n; i++) {
+		rio_worker_shutdown(workers + i);
+	}
+}
+
+#define rio_workerclass_shutdown(flow, class) \
+	rio_workerclass_shutdown_((flow)->rf_##class, \
+	    rio_flow_##class##_workers)
+
+static inline void
 rio_issuer_destroy(struct rio_issuer *issuer)
 {
 	mtx_lock(&issuer->ri_lock);
+	issuer->ri_shutdown = true;
 	cv_broadcast(&issuer->ri_cond);
 	while (issuer->ri_threads > 0) {
 		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
@@ -2646,7 +2668,17 @@ rio_shutdown(void)
 	u_int cpu;
 
 	mtx_lock(&rio_shutdown_lock);
-	atomic_store_rel_int(&rio_shutdown_pending, true);
+	rio_shutdown_pending = true;
+	CPU_FOREACH(cpu) {
+		struct rio_flow *flow;
+
+		flow = DPCPU_ID_PTR(cpu, rio_flow);
+		rio_issuer_shutdown(&flow->rf_issuer);
+		rio_workerclass_shutdown(flow, read);
+		rio_workerclass_shutdown(flow, write);
+		rio_workerclass_shutdown(flow, sync);
+		rio_workerclass_shutdown(flow, socket);
+	}
 	while (rio_open_count > 0) {
 		cv_wait(&rio_shutdown_cond, &rio_shutdown_lock);
 	}
