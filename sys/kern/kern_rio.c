@@ -162,9 +162,6 @@ rio_vmspace_init(struct vmspace *vm)
 {
 	struct rio_worker_affinity *waff;
 
-	if (vm->vm_rio != NULL) {
-		return;
-	}
 	waff = BITSET_ALLOC(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
 	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)waff)) {
 		BITSET_FREE(waff, M_RIO);
@@ -1907,10 +1904,11 @@ rio_worker_lookup(u_int id)
 void
 rio_vmspace_exit(struct vmspace *vm)
 {
-	struct rio_worker_affinity *waff = vm->vm_rio;
+	struct rio_worker_affinity *waff;
 	size_t id;
 
-	if (waff == NULL) {
+	if ((waff = (struct rio_worker_affinity *)atomic_swap_ptr(
+	    (uintptr_t *)&vm->vm_rio, 0)) == NULL) {
 		return;
 	}
 	/* Signal any sleeping workers using this vmspace. */
@@ -1924,7 +1922,6 @@ rio_vmspace_exit(struct vmspace *vm)
 		mtx_unlock(&worker->rw_lock);
 	}
 	BITSET_FREE(waff, M_RIO);
-	vm->vm_rio = NULL;
 }
 
 /* TODO: src/flow schedulers deep dive */
