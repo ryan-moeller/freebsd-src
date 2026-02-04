@@ -681,6 +681,9 @@ static u_int rio_attention_span = 1024;
 SYSCTL_UINT(_kern_rio, OID_AUTO, attention_span, CTLFLAG_RW,
     &rio_attention_span, 0, "Single-source I/O batch size");
 
+/* issuer/worker kickstart */
+static struct taskqueue *rio_kick;
+
 /*
  * A RIO issuer is a queue of IO request sources serviced by a collection of
  * kernel threads pinned to a CPU.  Each source is drained according to an IO
@@ -695,11 +698,45 @@ struct rio_issuer {
 	int			ri_phase;	/* for reducing bias */
 	u_int			ri_cpu;
 	u_int			ri_threads;
+	bool			ri_shutdown;
+	struct unrhdr		*ri_unr;
+	struct rio_issuer_arg	*ri_tasks;	/* for adding threads */
 };
+
+struct rio_issuer_arg {
+	struct rio_issuer	*ria_issuer;
+	struct task		ria_task;
+};
+
+static inline u_int
+rio_issuer_arg_idx(struct rio_issuer_arg *ria)
+{
+	return (ria - ria->ria_issuer->ri_tasks);
+}
+
+static inline int
+rio_issuer_kick_check(struct rio_issuer *issuer)
+{
+	mtx_assert(&issuer->ri_lock, MA_OWNED);
+	/* TODO: policy for threshold? */
+	if (issuer->ri_len > issuer->ri_threads &&
+	    issuer->ri_threads < rio_flow_issuer_threads) {
+		issuer->ri_threads++;
+		return (alloc_unrl(issuer->ri_unr));
+	}
+	return (-1);
+}
+
+static inline void
+rio_issuer_kick(struct rio_issuer *issuer, u_int idx)
+{
+	taskqueue_enqueue(rio_kick, &issuer->ri_tasks[idx].ria_task);
+}
 
 static inline void
 rio_issuer_enqueue(struct rio_issuer *issuer, struct rio_src *src)
 {
+	int idx;
 	bool wake;
 
 	/* Refill attention credits when enqueued to the back. */
@@ -708,15 +745,20 @@ rio_issuer_enqueue(struct rio_issuer *issuer, struct rio_src *src)
 	wake = STAILQ_EMPTY(&issuer->ri_srcs);
 	STAILQ_INSERT_TAIL(&issuer->ri_srcs, src, rs_srcs);
 	issuer->ri_len++;
+	idx = rio_issuer_kick_check(issuer);
 	if (wake) {
 		cv_signal(&issuer->ri_cond);
 	}
 	mtx_unlock(&issuer->ri_lock);
+	if (idx != -1) {
+		rio_issuer_kick(issuer, idx);
+	}
 }
 
 static inline void
 rio_issuer_enqueue_front(struct rio_issuer *issuer, struct rio_src *src)
 {
+	int idx;
 	bool wake;
 
 	/* Keep existing credits when enqueued to the front. */
@@ -725,11 +767,19 @@ rio_issuer_enqueue_front(struct rio_issuer *issuer, struct rio_src *src)
 	wake = STAILQ_EMPTY(&issuer->ri_srcs);
 	STAILQ_INSERT_HEAD(&issuer->ri_srcs, src, rs_srcs);
 	issuer->ri_len++;
+	idx = rio_issuer_kick_check(issuer);
 	if (wake) {
 		cv_signal(&issuer->ri_cond);
 	}
 	mtx_unlock(&issuer->ri_lock);
+	if (idx != -1) {
+		rio_issuer_kick(issuer, idx);
+	}
 }
+
+static sbintime_t rio_flow_issuer_idle = SBT_1S;
+SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, issuer_idle_ms, CTLFLAG_RWTUN,
+    &rio_flow_issuer_idle, "Issuer idle timeout (ms)");
 
 static inline int
 rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
@@ -737,15 +787,23 @@ rio_issuer_dequeue(struct rio_issuer *issuer, struct rio_src **srcp)
 	struct rio_src *src;
 
 	mtx_lock(&issuer->ri_lock);
-	while (STAILQ_EMPTY(&issuer->ri_srcs)) {
-		/* TODO: timeout for autoscaling */
-		cv_wait(&issuer->ri_cond, &issuer->ri_lock);
+	for (;;) {
 		if (__predict_false(issuer->ri_shutdown)) {
 			mtx_unlock(&issuer->ri_lock);
 			return (ESHUTDOWN);
 		}
+		if ((src = STAILQ_FIRST(&issuer->ri_srcs)) != NULL) {
+			break;
+		}
+		if (cv_timedwait_sbt(&issuer->ri_cond, &issuer->ri_lock,
+		    rio_flow_issuer_idle, SBT_1MS, 0) == EWOULDBLOCK) {
+			if (!STAILQ_EMPTY(&issuer->ri_srcs)) {
+				continue;
+			}
+			mtx_unlock(&issuer->ri_lock);
+			return (EWOULDBLOCK);
+		}
 	}
-	src = STAILQ_FIRST(&issuer->ri_srcs);
 	STAILQ_REMOVE_HEAD(&issuer->ri_srcs, rs_srcs);
 	issuer->ri_len--;
 	issuer->ri_phase++;
@@ -1634,7 +1692,7 @@ sowakeup_rio(struct socket *so, sb_which which)
 
 	if ((sb->sb_flags & SB_RIO_RUNNING) == 0) {
 		sb->sb_flags |= SB_RIO_RUNNING;
-		taskqueue_enqueue(taskqueue_thread, &sb->sb_riotask);
+		taskqueue_enqueue(rio_kick, &sb->sb_riotask);
 	}
 }
 
@@ -1716,17 +1774,20 @@ struct rio_worker {
 	struct cv		rw_cond;
 	struct rio_srcios	rw_srcios;
 	rio_srcio_handler_f	*rw_handler;	/* specialized handler */
+	const char		*rw_classname;
 	u_int			rw_len;
 	u_int			rw_cpu;
-	u_int			rw_id;
-	bool			rw_done;
+	u_int			rw_idx;
+	u_int			rw_id;		/* global worker id */
+	bool			rw_running;
 	bool			rw_shutdown;
+	struct task		rw_task;	/* create kproc */
 };
 
 static inline void
 rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 {
-	bool wake;
+	bool wake, kick;
 
 	mtx_lock(&worker->rw_lock);
 	wake = STAILQ_EMPTY(&worker->rw_srcios);
@@ -1735,28 +1796,43 @@ rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 	if (wake) {
 		cv_signal(&worker->rw_cond);
 	}
+	kick = !worker->rw_running;
+	worker->rw_running = true;
 	mtx_unlock(&worker->rw_lock);
+	if (kick) {
+		taskqueue_enqueue(rio_kick, &worker->rw_task);
+	}
 }
+
+static sbintime_t rio_flow_worker_idle = SBT_1S;
+SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, worker_idle_ms, CTLFLAG_RWTUN,
+    &rio_flow_worker_idle, "Worker idle timeout (ms)");
 
 static inline int
 rio_worker_dequeue(struct rio_worker *worker, struct rio_srcio **srciop)
 {
 	struct rio_srcio *srcio;
+	int error = 0;
 
 	mtx_lock(&worker->rw_lock);
-	if (STAILQ_EMPTY(&worker->rw_srcios)) {
-		/* TODO: timeout for autoscaling */
-		cv_wait(&worker->rw_cond, &worker->rw_lock);
-	}
 	if (__predict_false(worker->rw_shutdown)) {
-		mtx_unlock(&worker->rw_lock);
 		return (ESHUTDOWN);
+	}
+	if (STAILQ_EMPTY(&worker->rw_srcios)) {
+		error = cv_timedwait_sbt(&worker->rw_cond, &worker->rw_lock,
+		    rio_flow_worker_idle, SBT_1MS, 0);
 	}
 	srcio = STAILQ_FIRST(&worker->rw_srcios);
 	if (__predict_false(srcio == NULL)) {
-		/* Signaled to relinquish vmspace. */
+		if (error == EWOULDBLOCK) {
+			worker->rw_running = false;
+		}
 		mtx_unlock(&worker->rw_lock);
-		return (ESRCH);
+		/*
+		 * If error is 0 we were signaled and the queue is empty.
+		 * Returning 0 without setting *srciop means switch vmspace.
+		 */
+		return (error);
 	}
 	STAILQ_REMOVE_HEAD(&worker->rw_srcios, rs_srcios);
 	worker->rw_len--;
@@ -2038,6 +2114,7 @@ rio_scheduler_reset(struct rio_scheduler *sched, struct rio_worker *workers,
 	rio_selector_reset(sel, srcio);
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
+		/* TODO: consider which workers are running? */
 		rio_selector_insert(sel, workers + i);
 	}
 	MPASS(sel->rs_n == len);
@@ -2249,7 +2326,8 @@ static void
 rio_issuer_thread(void *arg)
 {
 	struct rio_scheduler sched;
-	struct rio_issuer *self = arg;
+	struct rio_issuer_arg *ria = arg;
+	struct rio_issuer *self = ria->ria_issuer;
 	struct thread *td = curthread;
 
 	thread_lock(td);
@@ -2379,6 +2457,7 @@ schedule:
 		rio_issuer_enqueue(self, src);
 	}
 	rio_scheduler_destroy(&sched);
+	free_unr(self->ri_unr, rio_issuer_arg_idx(ria));
 	mtx_lock(&self->ri_lock);
 	self->ri_threads--;
 	if (self->ri_threads == 0) {
@@ -2400,7 +2479,7 @@ rio_worker_proc(void *arg)
 	sched_bind(td, self->rw_cpu);
 	thread_unlock(td);
 	for (;;) {
-		struct rio_srcio *srcio;
+		struct rio_srcio *srcio = NULL;
 		struct riocb *iocb;
 		enum rio_status status;
 		int error;
@@ -2411,10 +2490,11 @@ rio_worker_proc(void *arg)
 		 * queue?  Separate queues gives us control over which worker we
 		 * schedule I/O on, which is how vmspace affinity is achieved.
 		 */
-		if ((error = rio_worker_dequeue(self, &srcio)) == ESHUTDOWN) {
+		error = rio_worker_dequeue(self, &srcio);
+		if (__predict_false(error == ESHUTDOWN || error == EWOULDBLOCK)) {
 			break;
 		}
-		if (error == ESRCH) {
+		if (__predict_false(srcio == NULL)) {
 			/* Relinquish vmspace on user process exit. */
 			rio_vmspace_switch(myvm, id);
 			continue;
@@ -2423,10 +2503,10 @@ rio_worker_proc(void *arg)
 		status = rio_status(srcio->rs_sc);
 		if (__predict_false(status != RIO_OPEN)) {
 			/*
-			 * Check if the user process is exiting.  The above
-			 * ESRCH check is for handling a wakeup when our queue
-			 * was empty.  This check handles the final dequeue when
-			 * the queue was not empty.
+			 * Check if the user process is exiting.  The above NULL
+			 * check is for handling a wakeup when our queue was
+			 * empty.  This check handles the final dequeue when the
+			 * queue was not empty.
 			 *
 			 * There is no need to do this when there is more in the
 			 * queue, because the next thing will switch vmspace for
@@ -2451,79 +2531,89 @@ rio_worker_proc(void *arg)
 	rio_vmspace_switch(myvm, id);
 	vmspace_free(myvm);
 	mtx_lock(&self->rw_lock);
-	self->rw_done = true;
 	cv_broadcast(&self->rw_cond);
 	mtx_unlock(&self->rw_lock);
 	kproc_exit(0);
 }
 
-static struct proc *rio_issuers;
+static struct proc *rio_proc;
 
-static inline int
-rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
+static void
+rio_issuer_start(void *arg, int pending __unused)
 {
+	struct rio_issuer_arg *ria = arg;
+	struct rio_issuer *issuer = ria->ria_issuer;
 	int error;
 
+	/* Spawn issuer threads in the main rio kernel process. */
+	if ((error = kproc_kthread_add(rio_issuer_thread, ria, &rio_proc, NULL,
+	    0, 0, NULL, "issue %u.%u", issuer->ri_cpu,
+	    rio_issuer_arg_idx(ria))) != 0) {
+		/* TODO: error handling */
+		MPASS(error != ESRCH);
+		printf("%s: kproc_kthread_add: %d\n", __func__, error);
+	}
+}
+
+static void
+rio_worker_start(void *arg, int pending __unused)
+{
+	struct rio_worker *worker = arg;
+	int error;
+
+	/* Spawn each worker as its own kernel process. */
+	if ((error = kproc_create(rio_worker_proc, worker, NULL, 0, 0,
+	    "rio/%s %u.%u", worker->rw_classname, worker->rw_cpu,
+	    worker->rw_idx)) != 0) {
+		/* TODO: error handling */
+		printf("%s: kproc_create: %d\n", __func__, error);
+	}
+}
+
+static inline void
+rio_issuer_init(struct rio_issuer *issuer, u_int cpu)
+{
 	issuer->ri_cpu = cpu;
 	issuer->ri_threads = 0;
 	mtx_init(&issuer->ri_lock, "rio issuer lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&issuer->ri_cond, "rio issuer cond");
 	STAILQ_INIT(&issuer->ri_srcs);
-	/* TODO: always initialize context, but add threads on demand */
-	for (u_int i = 0; i < rio_flow_issuer_threads; i++) {
-		/* Spawn issuer threads in the proc0 kernel process. */
-		if ((error = kproc_kthread_add(rio_issuer_thread, issuer,
-		    &rio_issuers, NULL, 0, 0, "rio", "issue %u.%u", cpu, i))
-		    != 0) {
-			/* TODO: error handling */
-			printf("%s: kproc_kthread_add: %d\n", __func__, error);
-			return (error);
-		}
-		issuer->ri_threads++;
+	issuer->ri_tasks = mallocarray(rio_flow_issuer_threads,
+	    sizeof(*issuer->ri_tasks), M_RIO, M_WAITOK);
+	for (int i = 0; i < rio_flow_issuer_threads; i++) {
+		struct rio_issuer_arg *ria = &issuer->ri_tasks[i];
+
+		ria->ria_issuer = issuer;
+		TASK_INIT(&ria->ria_task, 0, rio_issuer_start, ria);
 	}
-	return (0);
+	issuer->ri_unr = new_unrhdr(0, rio_flow_issuer_threads - 1, UNR_NO_MTX);
 }
 
-static inline int
+static inline void
 rio_worker_init(struct rio_worker *worker, rio_srcio_handler_f *handler,
-    const char *classname, u_int cpu, u_int i)
+    const char *classname, u_int cpu, u_int idx)
 {
 	static u_int nextid;
-	int error;
 
+	worker->rw_classname = classname;
 	worker->rw_handler = handler;
 	worker->rw_cpu = cpu;
+	worker->rw_idx = idx;
 	worker->rw_id = nextid++;
-	worker->rw_done = false;
 	mtx_init(&worker->rw_lock, "rio worker lock", NULL, MTX_DEF | MTX_NEW);
 	cv_init(&worker->rw_cond, "rio worker cond");
 	STAILQ_INIT(&worker->rw_srcios);
-	/* Spawn each worker as its own kernel process. */
-	/* TODO: always initialize context, but create processes on demand */
-	if ((error = kproc_create(rio_worker_proc, worker, NULL, 0, 0,
-	    "rio/%s %u.%u", classname, cpu, i)) != 0) {
-		/* TODO: error handling */
-		printf("%s: kproc_create: %d\n", __func__, error);
-		return (error);
-	}
-	return (0);
+	TASK_INIT(&worker->rw_task, 0, rio_worker_start, worker);
 }
 
-static inline int
+static inline void
 rio_workerclass_init_(struct rio_worker **workers, rio_srcio_handler_f *handler,
     const char *classname, u_int cpu, u_int n)
 {
-	int error;
-
 	*workers = mallocarray(n, sizeof(**workers), M_RIO, M_WAITOK | M_ZERO);
 	for (u_int i = 0; i < n; i++) {
-		if ((error = rio_worker_init(*workers + i, handler, classname,
-		    cpu, i)) != 0) {
-			/* TODO: error handling */
-			return (error);
-		}
+		rio_worker_init(*workers + i, handler, classname, cpu, i);
 	}
-	return (0);
 }
 
 #define rio_workerclass_init(flow, class, cpu) \
@@ -2537,15 +2627,20 @@ rio_zcreate(const char *name, size_t size)
 	    0));
 }
 
-static int
-rio_load(void)
+#define RIO_TASKQUEUE_CREATE_THREAD(name) ({ \
+	name = taskqueue_create(#name, M_WAITOK, taskqueue_thread_enqueue, \
+	    &name); \
+	taskqueue_start_threads_in_proc(&name, 1, PWAIT, curproc, "%s taskq", \
+	    #name); \
+})
+
+static void
+rio_bootstrap(void *arg __unused)
 {
 	u_int cpu;
-	int error;
 
-	rio_doom = taskqueue_create("rio doom", M_WAITOK | M_ZERO,
-	    taskqueue_thread_enqueue, &rio_doom);
-	taskqueue_start_threads(&rio_doom, 1, PWAIT, "rio doom taskq");
+	RIO_TASKQUEUE_CREATE_THREAD(rio_doom);
+	RIO_TASKQUEUE_CREATE_THREAD(rio_kick);
 
 	rio_src_zone = rio_zcreate("rio src", sizeof(struct rio_src));
 	rio_srcio_zone = rio_zcreate("rio src+io", sizeof(struct rio_srcio));
@@ -2558,39 +2653,31 @@ rio_load(void)
 		struct rio_flow *flow;
 
 		flow = DPCPU_ID_PTR(cpu, rio_flow);
-		if ((error = rio_issuer_init(&flow->rf_issuer, cpu)) != 0) {
-			/* TODO: error handling */
-			printf("%s: rio_issuer_init: %d\n", __func__, error);
-			return (error);
-		}
-		if ((error = rio_workerclass_init(flow, read, cpu)) != 0) {
-			/* TODO: error handling */
-			printf("%s: rio_workerclass_init (read): %d\n",
-			    __func__, error);
-			return (error);
-		}
-		if ((error = rio_workerclass_init(flow, write, cpu)) != 0) {
-			/* TODO: error handling */
-			printf("%s: rio_workerclass_init (write): %d\n",
-			    __func__, error);
-			return (error);
-		}
-		if ((error = rio_workerclass_init(flow, sync, cpu)) != 0) {
-			/* TODO: error handling */
-			printf("%s: rio_workerclass_init (sync): %d\n",
-			    __func__, error);
-			return (error);
-		}
-		if ((error = rio_workerclass_init(flow, socket, cpu)) != 0) {
-			/* TODO: error handling */
-			printf("%s: rio_workerclass_init (socket): %d\n",
-			    __func__, error);
-			return (error);
-		}
+		rio_issuer_init(&flow->rf_issuer, cpu);
+		rio_workerclass_init(flow, read, cpu);
+		rio_workerclass_init(flow, write, cpu);
+		rio_workerclass_init(flow, sync, cpu);
+		rio_workerclass_init(flow, socket, cpu);
 		/* TODO: more worker classes? */
 		rio_socket_issuer_init(DPCPU_ID_PTR(cpu, rio_socket_issuer));
 	}
-	return (0);
+	kthread_exit();
+}
+
+static int
+rio_load(void)
+{
+	int error;
+
+	/*
+	 * Work around having no TASKQUEUE_DEFINE_PROC by creating a proc to
+	 * start the taskqueues.  Let it do the rest of the initialization.
+	 */
+	error = kproc_create(rio_bootstrap, NULL, &rio_proc, 0, 0, "rio");
+	if (error != 0) {
+		printf("%s: kproc_create: %d\n", __func__, error);
+	}
+	return (error);
 }
 
 static inline void
@@ -2634,6 +2721,9 @@ rio_issuer_destroy(struct rio_issuer *issuer)
 	mtx_unlock(&issuer->ri_lock);
 	mtx_destroy(&issuer->ri_lock);
 	cv_destroy(&issuer->ri_cond);
+	clean_unrhdr(issuer->ri_unr);
+	delete_unrhdr(issuer->ri_unr);
+	free(issuer->ri_tasks, M_RIO);
 }
 
 static inline void
@@ -2641,7 +2731,7 @@ rio_worker_destroy(struct rio_worker *worker)
 {
 	mtx_lock(&worker->rw_lock);
 	cv_signal(&worker->rw_cond);
-	while (!worker->rw_done) {
+	while (worker->rw_running) {
 		cv_wait(&worker->rw_cond, &worker->rw_lock);
 	}
 	MPASS(STAILQ_EMPTY(&worker->rw_srcios));
@@ -2697,6 +2787,8 @@ rio_shutdown(void)
 	}
 	taskqueue_quiesce(rio_doom);
 	taskqueue_free(rio_doom);
+	taskqueue_quiesce(rio_kick);
+	taskqueue_free(rio_kick);
 	uma_zdestroy(rio_src_zone);
 	uma_zdestroy(rio_srcio_zone);
 	uma_zdestroy(rio_srcio_ext_zone);
