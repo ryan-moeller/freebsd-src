@@ -10,7 +10,6 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bio.h>
-#include <sys/bitset.h>
 #include <sys/bitstring.h>
 #include <sys/buf.h>
 #include <sys/condvar.h>
@@ -154,17 +153,27 @@ static bool rio_shutdown_pending;
 static u_int rio_max_flow_workers;
 static u_int rio_max_workers;
 
-BITSET_DEFINE_VAR(rio_worker_affinity);
-
 static inline void
 rio_vmspace_init(struct vmspace *vm)
 {
-	struct rio_worker_affinity *waff;
+	bitstr_t *waff; /* worker affinity */
 
-	waff = BITSET_ALLOC(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
+	waff = bit_alloc(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
 	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)waff)) {
-		BITSET_FREE(waff, M_RIO);
+		free(waff, M_RIO);
 	}
+}
+
+/* TODO: belongs in sys/bitstring.h */
+static inline void
+bit_set_atomic(bitstr_t *bitstr, size_t bit)
+{
+	atomic_set_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
+}
+static inline void
+bit_clear_atomic(bitstr_t *bitstr, size_t bit)
+{
+	atomic_clear_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
 }
 
 static inline void
@@ -174,24 +183,22 @@ rio_vmspace_switch(struct vmspace *vm, u_int id)
 
 	if (vm != oldvm) {
 		if (oldvm->vm_rio != NULL) {
-			BIT_CLR_ATOMIC(rio_max_workers, id, oldvm->vm_rio);
+			bit_clear_atomic(oldvm->vm_rio, id);
 		}
 		if (vm->vm_rio != NULL) {
-			BIT_SET_ATOMIC(rio_max_workers, id, vm->vm_rio);
+			bit_set_atomic(vm->vm_rio, id);
 		}
 		vmspace_switch_aio(vm);
 	}
 }
 
-BITSET_DEFINE_VAR(rio_flow_affinity);
-
-VNET_DEFINE_STATIC(struct rio_flow_affinity *, rio_vnet_flow_affinity);
+VNET_DEFINE_STATIC(bitstr_t *, rio_vnet_flow_affinity);
 #define V_rio_vnet_flow_affinity VNET(rio_vnet_flow_affinity)
 
 static void
 rio_vnet_init(const void *arg __unused)
 {
-	V_rio_vnet_flow_affinity = BITSET_ALLOC(mp_ncpus, M_RIO,
+	V_rio_vnet_flow_affinity = bit_alloc(mp_ncpus, M_RIO,
 	    M_WAITOK | M_ZERO);
 }
 VNET_SYSINIT(rio_vnet_init, SI_SUB_PROTO_BEGIN, SI_ORDER_ANY, rio_vnet_init,
@@ -200,7 +207,7 @@ VNET_SYSINIT(rio_vnet_init, SI_SUB_PROTO_BEGIN, SI_ORDER_ANY, rio_vnet_init,
 static void
 rio_vnet_uninit(const void *arg __unused)
 {
-	BITSET_FREE(V_rio_vnet_flow_affinity, M_RIO);
+	free(V_rio_vnet_flow_affinity, M_RIO);
 }
 VNET_SYSUNINIT(rio_vnet_uninit, SI_SUB_PROTO_BEGIN, SI_ORDER_ANY,
     rio_vnet_uninit, NULL);
@@ -210,12 +217,11 @@ rio_vnet_switch(struct vnet *vnet)
 {
 	if (vnet != curvnet) {
 		if (curvnet != NULL) {
-			BIT_CLR_ATOMIC(mp_ncpus, curcpu,
-			    V_rio_vnet_flow_affinity);
+			bit_clear_atomic(V_rio_vnet_flow_affinity, curcpu);
 		}
 		if (vnet != NULL) {
-			BIT_SET_ATOMIC(mp_ncpus, curcpu,
-			    VNET_VNET(vnet, rio_vnet_flow_affinity));
+			bit_set_atomic(VNET_VNET(vnet, rio_vnet_flow_affinity),
+			    curcpu);
 		}
 		/* The network stack updates curvnet itself as needed. */
 	}
@@ -1909,15 +1915,15 @@ rio_worker_lookup(u_int id)
 void
 rio_vmspace_exit(struct vmspace *vm)
 {
-	struct rio_worker_affinity *waff;
+	bitstr_t *waff; /* worker affinity */
 	size_t id;
 
-	if ((waff = (struct rio_worker_affinity *)atomic_swap_ptr(
-	    (uintptr_t *)&vm->vm_rio, 0)) == NULL) {
+	waff = (bitstr_t *)atomic_swap_ptr((uintptr_t *)&vm->vm_rio, 0);
+	if (waff == NULL) {
 		return;
 	}
 	/* Signal any sleeping workers using this vmspace. */
-	BIT_FOREACH_ISSET(rio_max_workers, id, waff) {
+	bit_foreach(waff, rio_max_workers, id) {
 		struct rio_worker *worker = rio_worker_lookup(id);
 
 		mtx_lock(&worker->rw_lock);
@@ -1926,7 +1932,7 @@ rio_vmspace_exit(struct vmspace *vm)
 		}
 		mtx_unlock(&worker->rw_lock);
 	}
-	BITSET_FREE(waff, M_RIO);
+	free(waff, M_RIO);
 }
 
 /* TODO: src/flow schedulers deep dive */
@@ -1957,11 +1963,11 @@ struct rio_selector {
 	bitstr_t	*rs_affine;
 	bitstr_t	*rs_minimum;
 	bitstr_t	*rs_candidates;
+	bitstr_t	*rs_vmspace_waff;
 	u_int		*rs_indices;
 	u_int		rs_len;
 	u_int		rs_min;
 	u_int		rs_n;
-	struct rio_worker_affinity	*rs_vmspace_waff;
 };
 
 static inline void
@@ -2017,7 +2023,7 @@ rio_selector_insert(struct rio_selector *sel, struct rio_worker *worker)
 	if (qlen == 0) {
 		bit_set(sel->rs_empty, idx);
 	}
-	if (BIT_ISSET(rio_max_workers, worker->rw_id, sel->rs_vmspace_waff)) {
+	if (bit_test(sel->rs_vmspace_waff, worker->rw_id)) {
 		bit_set(sel->rs_affine, idx);
 	}
 	if (qlen == sel->rs_min) {
