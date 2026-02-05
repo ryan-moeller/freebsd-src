@@ -545,7 +545,7 @@ rio_iocb_complete(struct rio_softc *sc, struct riocb *iocb, int cberror,
 	}
 	MPASS(error == 0);
 	if (__predict_false(rio_status(sc) != RIO_OPEN) &&
-	    __predict_false(rio_inflight(sc) == 0)) {
+	    rio_inflight(sc) == 0) {
 		taskqueue_enqueue(rio_doom, &sc->sc_destroy_task);
 	}
 }
