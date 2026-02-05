@@ -721,10 +721,12 @@ rio_issuer_kick_check(struct rio_issuer *issuer)
 {
 	mtx_assert(&issuer->ri_lock, MA_OWNED);
 	/* TODO: policy for threshold? */
-	if (issuer->ri_len > issuer->ri_threads &&
-	    issuer->ri_threads < rio_flow_issuer_threads) {
+	if (issuer->ri_threads < MIN(issuer->ri_len, rio_flow_issuer_threads)) {
+		int idx = alloc_unrl(issuer->ri_unr);
+
+		MPASS(idx != -1);
 		issuer->ri_threads++;
-		return (alloc_unrl(issuer->ri_unr));
+		return (idx);
 	}
 	return (-1);
 }
