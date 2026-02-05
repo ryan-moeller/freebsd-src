@@ -150,10 +150,9 @@ MTX_SYSINIT(rio_shutdown_lock, &rio_shutdown_lock, "rio shutdown lock",
 static struct cv rio_shutdown_cond;
 static bool rio_shutdown_pending;
 
-/* size of riopriv bitset */
-static u_int rio_max_workers = PAGE_SIZE * NBBY;
-SYSCTL_UINT(_kern_rio, OID_AUTO, max_workers, CTLFLAG_RDTUN, &rio_max_workers,
-    0, "Max worker processes (sizes worker affinity bitset)");
+/* Dimensions for worker affinity. */
+static u_int rio_max_flow_workers;
+static u_int rio_max_workers;
 
 BITSET_DEFINE_VAR(rio_worker_affinity);
 
@@ -1876,9 +1875,7 @@ rio_flow_classify(struct rio_flow *flow, struct rio_srcio *srcio, u_int *lenp)
 static inline struct rio_worker *
 rio_worker_lookup(u_int id)
 {
-	const size_t flow_stride = rio_flow_read_workers +
-	    rio_flow_write_workers + rio_flow_sync_workers +
-	    rio_flow_socket_workers;
+	const u_int flow_stride = rio_max_flow_workers;
 	const u_int class_strides[] = {
 		rio_flow_read_workers,
 		rio_flow_write_workers,
@@ -2638,6 +2635,11 @@ rio_bootstrap(void *arg __unused)
 
 	RIO_TASKQUEUE_CREATE_THREAD(rio_doom);
 	RIO_TASKQUEUE_CREATE_THREAD(rio_kick);
+
+	rio_max_flow_workers = rio_flow_read_workers + rio_flow_write_workers +
+	    rio_flow_sync_workers + rio_flow_socket_workers;
+	/* TODO: more worker classes? */
+	rio_max_workers = mp_ncpus * rio_max_flow_workers;
 
 	rio_src_zone = rio_zcreate("rio src", sizeof(struct rio_src));
 	rio_srcio_zone = rio_zcreate("rio src+io", sizeof(struct rio_srcio));
