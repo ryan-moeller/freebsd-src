@@ -644,9 +644,11 @@ rio_submit(struct file *fp, struct thread *td)
 	MPASS(fp->f_type == DTYPE_SHM);
 	shmfd = fp->f_data;
 	if (__predict_false((sc = shmfd->shm_rio) == NULL)) {
+		printf("%s: no rio\n", __func__);
 		return (ENOTTY);
 	}
 	if (__predict_false(sc->sc_proc != td->td_proc)) {
+		printf("%s: wrong proc\n", __func__);
 		return (EDOOFUS);
 	}
 	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
