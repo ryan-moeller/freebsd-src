@@ -432,9 +432,12 @@ rio_submissions_dequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 {
 	struct rio_slot slot;
 	struct rio *rio = sc->sc_rio;
+	u_int inflight = rio_inflight(sc);
+	u_int limit = sc->sc_config.rio_cqlen - 1;
 
 	/* Enforce inflight < cqlen so completion cannot block workers. */
-	if (rio_inflight(sc) >= sc->sc_config.rio_cqlen - 1) {
+	MPASS(inflight <= limit);
+	if (inflight == limit) {
 		return (NULL);
 	}
 	if (CK_RING_DEQUEUE_MPSC(rio, &rio->rio_submission.rr_ring,
