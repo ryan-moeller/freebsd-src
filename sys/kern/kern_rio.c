@@ -591,6 +591,7 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	shmfd = fp->f_data;
 	if (shmfd->shm_path != NULL ||
 	    conf->rio_policy_id >= nitems(rio_src_policies)) {
+		/* TODO: custom policy */
 		return (EINVAL);
 	}
 	if ((error = rio_open(&sc)) != 0) {
@@ -2546,8 +2547,8 @@ rio_issuer_start(void *arg, int pending __unused)
 	if ((error = kproc_kthread_add(rio_issuer_thread, ria, &rio_proc, NULL,
 	    0, 0, NULL, "issue %u.%u", issuer->ri_cpu,
 	    rio_issuer_arg_idx(ria))) != 0) {
-		/* TODO: error handling */
 		MPASS(error != ESRCH);
+		/* TODO: error handling */
 		printf("%s: kproc_kthread_add: %d\n", __func__, error);
 	}
 }

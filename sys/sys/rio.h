@@ -24,7 +24,7 @@ struct rio_config {
 };
 #define	FIORIOCONFIGURE	_IOW('R', 0, struct rio_config)
 #define	FIORIOSUBMIT	_IO('R', 1)
-/* TODO: ioctls to change configuration? */
+/* TODO: ioctls to change policy(/configuration?) */
 
 /* RIO commands */
 #define RIO_NOP		0x0
