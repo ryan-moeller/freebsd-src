@@ -782,7 +782,7 @@ rio_issuer_enqueue_front(struct rio_issuer *issuer, struct rio_src *src)
 }
 
 static sbintime_t rio_flow_issuer_idle = SBT_1S;
-SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, issuer_idle_ms, CTLFLAG_RWTUN,
+SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, issuer_idle_ms, CTLFLAG_RW,
     &rio_flow_issuer_idle, "Issuer idle timeout (ms)");
 
 static inline int
@@ -1809,7 +1809,7 @@ rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 }
 
 static sbintime_t rio_flow_worker_idle = SBT_1S;
-SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, worker_idle_ms, CTLFLAG_RWTUN,
+SYSCTL_SBINTIME_MSEC(_kern_rio_flow, OID_AUTO, worker_idle_ms, CTLFLAG_RW,
     &rio_flow_worker_idle, "Worker idle timeout (ms)");
 
 static inline int
