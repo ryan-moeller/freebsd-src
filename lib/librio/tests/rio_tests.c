@@ -25,7 +25,7 @@
 #define SQLEN	32
 #define CQLEN	32
 #define NCB	128	/* > SQLEN + CQLEN */
-#define POLICY	0
+#define POLICY	RIO_POLICY_SOFT_AFFINITY
 #define TESTCONFIG	SQLEN, CQLEN, NCB, POLICY
 
 ATF_TC(create_destroy);
@@ -217,7 +217,7 @@ ATF_TC_BODY(saturation, tc)
 	const struct timespec deadline = {0};
 	struct riocb iocb = {0};
 	rio_t rio = NULL;
-	int fd, s, c;
+	int fd, q, s, c;
 
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
@@ -227,24 +227,25 @@ ATF_TC_BODY(saturation, tc)
 	iocb.rio_buf = __DECONST(char *, "test");
 	iocb.rio_length = 4;
 	/* TODO: Test with multiple threads and different qlens/ncb. */
-	s = c = 0;
+	q = s = c = 0;
 	while (s < limit) {
 		/* Non-blocking enqueue, submit when full. */
 		while (rio_write(rio, &iocb, &deadline) != -1) {
-			s++;
+			q++;
 		}
 		ATF_CHECK_INTEQ(ETIMEDOUT, errno);
 		/* Submission queue full. */
 		ATF_CHECK(rio_submit(rio) != -1);
+		s = q;
 		/* Blocking enqueue, submit when full again. */
-		for (int i = 0; i < SQLEN - 1; i++) {
+		for (; q - s < CQLEN - 1; q++) {
 			ATF_CHECK(rio_fsync(rio, &iocb, NULL) != -1);
-			s++;
 		}
 		/* Submissions full. */
 		ATF_CHECK_ERRNO(ETIMEDOUT, rio_fsync(rio, &iocb, &deadline));
 		/* Can submit, but we're immediately kicked off the issuer. */
 		ATF_CHECK(rio_submit(rio) != -1);
+		s = q;
 		/*
 		 * The submissions being full is our hint to drain completions.
 		 */
@@ -259,8 +260,10 @@ ATF_TC_BODY(saturation, tc)
 		 * earlier, so the queue must be resubmit before it starts
 		 * being issued.
 		 */
-		ATF_CHECK_ERRNO(ETIMEDOUT, rio_read(rio, &iocb, &deadline));
+		ATF_CHECK(rio_read(rio, &iocb, &deadline) == -1);
+		ATF_CHECK_INTEQ(errno, ETIMEDOUT);
 		ATF_CHECK(rio_submit(rio) != -1);
+		s = q;
 		/* We have to keep polling to make progress. */
 		while (s - c > 0) {
 			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
@@ -276,6 +279,8 @@ ATF_TC_BODY(saturation, tc)
 		ATF_CHECK_INTEQ(iocb.rio_error, 0);
 		c++;
 	}
+	ATF_CHECK(q == s);
+	ATF_CHECK(s == c);
 
 	ATF_CHECK(close(fd) != -1);
 	rio_destroy(rio);
