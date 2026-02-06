@@ -4,10 +4,10 @@
  * Copyright (c) 2026 Ryan Moeller
  */
 
-#ifndef _RIO_INTERNAL_H_
-#define _RIO_INTERNAL_H_
+#pragma once
 
 #include <sys/rio.h>
+
 #include <ck_ec.h>
 #include <ck_ring.h>
 
@@ -58,4 +58,8 @@ rio_config_size(const struct rio_config *conf)
 	    (conf->rio_sqlen + conf->rio_cqlen) * sizeof(struct rio_slot));
 }
 
-#endif /* !_RIO_INTERNAL_H_ */
+#ifdef _KERNEL
+#include <sys/malloc.h>
+
+MALLOC_DECLARE(M_RIO);
+#endif /* !_KERNEL */

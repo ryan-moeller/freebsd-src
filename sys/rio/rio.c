@@ -45,11 +45,12 @@
 #include <sys/user.h>
 #include <sys/vnode.h>
 
+#include <ck_ec.h>
+#include <ck_ring.h>
+
 #include <geom/geom.h>
 
 #include <net/vnet.h>
-
-#include <rio/rio_internal.h>
 
 #include <security/mac/mac_framework.h>
 
@@ -61,96 +62,16 @@
 #include <vm/vm_page.h>
 #include <vm/vnode_pager.h>
 
-#include <ck_ec.h>
-#include <ck_ring.h>
+#include "rio_internal.h"
+#include "rio_io.h"
+#include "rio_selector.h"
 
 FEATURE(rio, "Ring I/O");
 
+MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
+
 static SYSCTL_NODE(_kern, OID_AUTO, rio, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
     "Ring IO configuration");
-
-static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
-
-struct rio_selector {
-	bitstr_t	*rs_empty;
-	bitstr_t	*rs_affine;
-	bitstr_t	*rs_minimum;
-	bitstr_t	*rs_candidates;
-	u_int		*rs_indices;
-	u_int		rs_len;
-	u_int		rs_min;
-	u_int		rs_n;
-};
-
-static inline void
-rio_selector_init(struct rio_selector *sel, u_int len)
-{
-	sel->rs_empty = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_affine = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_minimum = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_candidates = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_indices = mallocarray(len, sizeof(u_int), M_RIO, M_WAITOK);
-	sel->rs_len = len;
-	sel->rs_min = UINT_MAX;
-	sel->rs_n = 0;
-}
-
-static inline void
-rio_selector_reset(struct rio_selector *sel, struct rio_softc *sc)
-{
-	u_int stop = sel->rs_len - 1;
-
-	bit_nclear(sel->rs_empty, 0, stop);
-	bit_nclear(sel->rs_affine, 0, stop);
-	bit_nclear(sel->rs_minimum, 0, stop);
-	sel->rs_min = UINT_MAX;
-	sel->rs_n = 0;
-}
-
-#if 0
-static inline void
-dump_bits(bitstr_t *bits, size_t len)
-{
-	ssize_t count;
-	u_int i;
-
-	bit_count(bits, 0, len, &count);
-	printf("%s: len=%zu count=%zd\n", __func__, len, count);
-	bit_foreach(bits, len, i) {
-		printf("%s: bit %u set\n", __func__, i);
-	}
-}
-#endif
-
-static inline void
-rio_selector_insert(struct rio_selector *sel, u_int qlen, bool affine)
-{
-	u_int idx = sel->rs_n++;
-
-	if (qlen == 0) {
-		bit_set(sel->rs_empty, idx);
-	}
-	if (affine) {
-		bit_set(sel->rs_affine, idx);
-	}
-	if (qlen == sel->rs_min) {
-		bit_set(sel->rs_minimum, idx);
-	} else if (qlen < sel->rs_min) {
-		sel->rs_min = qlen;
-		bit_nclear(sel->rs_minimum, 0, idx);
-		bit_set(sel->rs_minimum, idx);
-	}
-}
-
-static inline void
-rio_selector_destroy(struct rio_selector *sel)
-{
-	free(sel->rs_empty, M_RIO);
-	free(sel->rs_affine, M_RIO);
-	free(sel->rs_minimum, M_RIO);
-	free(sel->rs_candidates, M_RIO);
-	free(sel->rs_indices, M_RIO);
-}
 
 struct rio_src_scheduler {
 	struct rio_selector	rss_sel;
@@ -329,41 +250,6 @@ rio_vnet_switch(struct vnet *vnet)
 	}
 }
 
-/* kernel-private IO control block */
-struct rio_io {
-	struct riocb	rio_cb;		/* validated and stable copy */
-	struct file	*rio_fd_file;	/* ref'd file descriptor */
-};
-
-/* Get the basic command, stripped of flags. */
-static inline u_int
-rio_io_cmd(struct rio_io *io)
-{
-	return (io->rio_cb.rio_cmd & ~RIO_CMD_FLAGS);
-}
-
-/* Get the flag bits of the control block command. */
-static inline u_int
-rio_io_flags(struct rio_io *io)
-{
-	return (io->rio_cb.rio_cmd & RIO_CMD_FLAGS);
-}
-
-static inline bool
-rio_io_vectored(struct rio_io *io)
-{
-	return ((rio_io_flags(io) & RIO_VECTORED) != 0);
-}
-
-static inline struct riocb *
-rio_io_kiocb(struct rio_io *io)
-{
-	return (&io->rio_cb);
-}
-
-/* list of all handles for debugging, protected by shutdown lock */
-static LIST_HEAD(, rio_softc) rio_handles;
-
 enum rio_status {
 	RIO_OPEN,	/* the handle is open */
 	RIO_CLOSING,	/* the handle is closing */
@@ -396,6 +282,9 @@ struct rio_softc {
 	struct ck_ec_mode	sc_ec_umtx_mode;
 	LIST_ENTRY(rio_softc)	sc_handles;
 };
+
+/* list of all handles for debugging, protected by shutdown lock */
+static LIST_HEAD(, rio_softc) rio_handles;
 
 static inline int
 rio_open(struct rio_softc **scp)
@@ -1399,12 +1288,6 @@ free:
 	return (error);
 }
 
-static inline int
-rio_io_foflag(struct rio_io *io)
-{
-	return ((rio_io_flags(io) & RIO_FOFFSET) == 0 ? FOF_OFFSET : 0);
-}
-
 /* Common context for blocking uio operations. */
 struct rio_uio {
 	struct uio	*ruio_uio;
@@ -1613,19 +1496,19 @@ rio_sockbuf_takefirst(struct sockbuf *sb)
 
 #ifdef RIO_SOCK_BUF_DEBUG
 #define RIO_SOCK_BUF_LOCK(sb, which) ({ \
-	printf("%s:%d LOCK sb=%p which=%d\n", __func__, __LINE__, sb, which); \
+	printf("%s:%u LOCK sb=%p which=%d\n", __func__, __LINE__, sb, which); \
 	SOCK_BUF_LOCK(sb, which); \
 })
 #define RIO_SOCK_BUF_LOCK_ASSERT(sb, which) ({ \
-	printf("%s:%d LOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	printf("%s:%u LOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
 	SOCK_BUF_LOCK_ASSERT(sb, which); \
 })
 #define RIO_SOCK_BUF_UNLOCK_ASSERT(sb, which) ({ \
-	printf("%s:%d UNLOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	printf("%s:%u UNLOCK ASSERT sb=%p which=%d\n", __func__, __LINE__, sb, which);\
 	SOCK_BUF_UNLOCK_ASSERT(sb, which); \
 })
 #define RIO_SOCK_BUF_UNLOCK(sb, which) ({ \
-	printf("%s:%d UNLOCK sb=%p which=%d\n", __func__, __LINE__, sb, which);\
+	printf("%s:%u UNLOCK sb=%p which=%d\n", __func__, __LINE__, sb, which);\
 	SOCK_BUF_UNLOCK(sb, which); \
 })
 #else
@@ -2081,7 +1964,7 @@ rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
 	u_int cpu;
 
 	mtx_assert(&sched->rss_lock, MA_OWNED);
-	rio_selector_reset(sel, sc);
+	rio_selector_reset(sel);
 	memset(sched->rss_affscore, 0, mp_ncpus * sizeof(*sched->rss_affscore));
 	CPU_FOREACH(cpu) {
 		struct rio_flow *flow = DPCPU_ID_PTR(cpu, rio_flow);
@@ -2311,7 +2194,7 @@ rio_srcio_scheduler_reset(struct rio_srcio_scheduler *sched,
 	struct rio_softc *sc = srcio->rs_sc;
 	bitstr_t *waff = sc->sc_vmspace->vm_rio; /* worker affinity */
 
-	rio_selector_reset(sel, sc);
+	rio_selector_reset(sel);
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
 		struct rio_worker *worker = workers + i;
@@ -2689,19 +2572,21 @@ rio_worker_proc(void *arg)
 	sched_bind(td, self->rw_cpu);
 	thread_unlock(td);
 	for (;;) {
-		struct rio_srcio *srcio = NULL;
+		struct rio_srcio *srcio;
 		struct riocb *iocb;
 		enum rio_status status;
 		int error;
 
-		/* TODO: Work stealing!
+		/* TODO: Work stealing! */
+		/*
 		 * Why not have one queue per worker class in each flow, and
 		 * have workers take from there instead of each having its own
 		 * queue?  Separate queues gives us control over which worker we
 		 * schedule I/O on, which is how vmspace affinity is achieved.
 		 */
 		error = rio_worker_dequeue(self, &srcio);
-		if (__predict_false(error == ESHUTDOWN || error == EWOULDBLOCK)) {
+		if (__predict_false(error != 0)) {
+			MPASS(error == ESHUTDOWN || error == EWOULDBLOCK);
 			break;
 		}
 		if (__predict_false(srcio == NULL)) {
