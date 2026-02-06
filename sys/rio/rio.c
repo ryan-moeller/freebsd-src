@@ -883,6 +883,7 @@ struct rio_srcio_ext {
 	struct iovec		rse_iov;
 	size_t			rse_completed;
 	u_int			rse_cpu;
+	bool			rse_charge;
 };
 
 static uma_zone_t rio_srcio_ext_zone;
@@ -919,6 +920,7 @@ rio_srcio_new(struct rio_softc *sc, struct rio_io *io)
 
 		rse->rse_completed = 0;
 		rse->rse_cpu = curcpu;
+		rse->rse_charge = false;
 	}
 	return (srcio);
 }
@@ -1104,6 +1106,24 @@ rio_bio_complete(struct bio *bp)
 
 	kiocb->rio_status = bp->bio_completed;
 	kiocb->rio_error = bp->bio_error;
+	if (bp->bio_completed > 0) {
+		struct proc *p = srcio->rs_sc->sc_proc;
+
+		/*
+		 * The resource usage can't be charged to a particular user
+		 * thread.
+		 */
+		PROC_STATLOCK(p);
+		switch (bp->bio_cmd) {
+		case BIO_READ:
+			p->p_ru.ru_inblock += btodb(bp->bio_completed);
+			break;
+		case BIO_WRITE:
+			p->p_ru.ru_oublock += btodb(bp->bio_completed);
+			break;
+		}
+		PROC_STATUNLOCK(p);
+	}
 	rio_srcio_complete(srcio);
 	rio_bio_destroy(bp);
 }
@@ -1297,11 +1317,17 @@ struct rio_uio {
 	/* internal storage */
 	struct uio	ruio__uio;
 	struct iovec	ruio__iov;
+	/* resource usage checkpoint */
+	long	ruio_msgsnd;
+	long	ruio_msgrcv;
+	long	ruio_oublock;
+	long	ruio_inblock;
 };
 
 static inline int
-rio_uio_setup(struct rio_uio *ruio, struct rio_srcio *srcio, struct thread *td)
+rio_uio_setup(struct rio_uio *ruio, struct rio_srcio *srcio)
 {
+	struct thread *td = curthread;
 	struct rio_io *io = srcio->rs_io;
 	struct riocb *kiocb = rio_io_kiocb(io);
 	struct uio *uio;
@@ -1328,12 +1354,27 @@ rio_uio_setup(struct rio_uio *ruio, struct rio_srcio *srcio, struct thread *td)
 	uio->uio_td = td;
 	ruio->ruio_uio = uio;
 	ruio->ruio_len = uio->uio_resid;
+	ruio->ruio_msgsnd = td->td_ru.ru_msgsnd;
+	ruio->ruio_msgrcv = td->td_ru.ru_msgrcv;
+	ruio->ruio_oublock = td->td_ru.ru_oublock;
+	ruio->ruio_inblock = td->td_ru.ru_inblock;
 	return (0);
 }
 
 static inline ssize_t
-rio_uio_completed(struct rio_uio *ruio)
+rio_uio_completed(struct rio_uio *ruio, struct proc *p)
 {
+	struct thread *td = curthread;
+
+	MPASS(td == ruio->ruio_uio->uio_td);
+
+	/* The resource usage can't be charged to a particular user thread. */
+	PROC_STATLOCK(p);
+	p->p_ru.ru_msgsnd += td->td_ru.ru_msgsnd - ruio->ruio_msgsnd;
+	p->p_ru.ru_msgrcv += td->td_ru.ru_msgrcv - ruio->ruio_msgrcv;
+	p->p_ru.ru_oublock += td->td_ru.ru_oublock - ruio->ruio_oublock;
+	p->p_ru.ru_inblock += td->td_ru.ru_inblock - ruio->ruio_inblock;
+	PROC_STATUNLOCK(p);
 	return (ruio->ruio_len - ruio->ruio_uio->uio_resid);
 }
 
@@ -1351,7 +1392,7 @@ rio_srcio_read(struct rio_srcio *srcio, u_int id)
 
 	td->td_ucred = sc->sc_cred;
 	rio_srcio_vmspace_switch(srcio, id);
-	if ((error = rio_uio_setup(&ruio, srcio, td)) != 0) {
+	if ((error = rio_uio_setup(&ruio, srcio)) != 0) {
 		rio_srcio_error(srcio, error);
 		return;
 	}
@@ -1363,7 +1404,7 @@ rio_srcio_read(struct rio_srcio *srcio, u_int id)
 	case ERESTART:
 	case EINTR:
 	case EWOULDBLOCK:
-		kiocb->rio_status = rio_uio_completed(&ruio);
+		kiocb->rio_status = rio_uio_completed(&ruio, sc->sc_proc);
 		break;
 	default:
 		kiocb->rio_status = -1;
@@ -1388,7 +1429,7 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 
 	td->td_ucred = sc->sc_cred;
 	rio_srcio_vmspace_switch(srcio, id);
-	if ((error = rio_uio_setup(&ruio, srcio, td)) != 0) {
+	if ((error = rio_uio_setup(&ruio, srcio)) != 0) {
 		rio_srcio_error(srcio, error);
 		return;
 	}
@@ -1408,7 +1449,7 @@ rio_srcio_write(struct rio_srcio *srcio, u_int id)
 	case ERESTART:
 	case EINTR:
 	case EWOULDBLOCK:
-		kiocb->rio_status = rio_uio_completed(&ruio);
+		kiocb->rio_status = rio_uio_completed(&ruio, p);
 		break;
 	default:
 		kiocb->rio_status = -1;
@@ -1531,7 +1572,10 @@ rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 	struct file *fp = io->rio_fd_file;
 	struct socket *so = fp->f_data;
 	struct sockbuf *sb = sobuf(so, which);
+	struct thread *td = curthread;
+	struct proc *p = sc->sc_proc;
 	size_t orig, completed = rse->rse_completed;
+	long ru;
 	int flags, error = 0;
 
 	/* We won't race with another RIO worker thanks to SB_RIO_RUNNING. */
@@ -1557,12 +1601,13 @@ rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 		uio->uio_rw = which == SO_RCV ? UIO_READ : UIO_WRITE;
 		srcio->rs_uio = uio;
 	}
-	uio->uio_td = curthread;
+	uio->uio_td = td;
 	orig = uio->uio_resid;
 	rio_vnet_switch(so->so_vnet);
 	flags = MSG_NBIO;
 	switch (which) {
 	case SO_SND:
+		ru = td->td_ru.ru_msgsnd;
 		if (!STAILQ_EMPTY(&sb->sb_riosrcios)) {
 			flags |= MSG_MORETOCOME;
 		}
@@ -1570,16 +1615,22 @@ rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 		error = mac_socket_check_send(fp->f_cred, so);
 #endif
 		if (__predict_true(error == 0)) {
-			error = sousrsend(so, NULL, uio, NULL, flags,
-			    sc->sc_proc);
+			error = sousrsend(so, NULL, uio, NULL, flags, p);
+			if (td->td_ru.ru_msgsnd != ru) {
+				rse->rse_charge = true;
+			}
 		}
 		break;
 	case SO_RCV:
+		ru = td->td_ru.ru_msgrcv;
 #ifdef MAC
 		error = mac_socket_check_receive(fp->f_cred, so);
 #endif
 		if (__predict_true(error == 0)) {
 			error = soreceive(so, NULL, uio, NULL, NULL, &flags);
+			if (td->td_ru.ru_msgrcv != ru) {
+				rse->rse_charge = true;
+			}
 		}
 		break;
 	}
@@ -1627,6 +1678,22 @@ rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 	}
 complete:
 	RIO_SOCK_BUF_UNLOCK_ASSERT(so, which);
+	if (rse->rse_charge) {
+		/*
+		 * The resource usage can't be charged to a particular user
+		 * thread.
+		 */
+		PROC_STATLOCK(p);
+		switch (which) {
+		case SO_SND:
+			p->p_ru.ru_msgsnd++;
+			break;
+		case SO_RCV:
+			p->p_ru.ru_msgrcv++;
+			break;
+		}
+		PROC_STATUNLOCK(p);
+	}
 	if (__predict_true(error == 0)) {
 		kiocb->rio_status = completed;
 		kiocb->rio_error = 0;
