@@ -10,9 +10,11 @@
 #include <sys/types.h>
 #include <sys/ioccom.h>
 
-/* scheduling policies */
-#define RIO_POLICY_NONE	0
-/* TBD (perhaps a policy that creates a dedicated polling kernel thread?) */
+/* scheduling policy presets */
+#define	RIO_POLICY_SOFT_AFFINITY	0
+#define	RIO_POLICY_LEAST_LOADED		1
+#define	RIO_POLICY_ROUND_ROBIN		2
+#define	RIO_POLICY_LOCAL_FLOW		3
 
 /* RIO ioctls */
 struct rio_config {

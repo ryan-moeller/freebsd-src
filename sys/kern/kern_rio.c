@@ -71,6 +71,97 @@ static SYSCTL_NODE(_kern, OID_AUTO, rio, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
 
 static MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 
+struct rio_selector {
+	bitstr_t	*rs_empty;
+	bitstr_t	*rs_affine;
+	bitstr_t	*rs_minimum;
+	bitstr_t	*rs_candidates;
+	u_int		*rs_indices;
+	u_int		rs_len;
+	u_int		rs_min;
+	u_int		rs_n;
+};
+
+static inline void
+rio_selector_init(struct rio_selector *sel, u_int len)
+{
+	sel->rs_empty = bit_alloc(len, M_RIO, M_WAITOK);
+	sel->rs_affine = bit_alloc(len, M_RIO, M_WAITOK);
+	sel->rs_minimum = bit_alloc(len, M_RIO, M_WAITOK);
+	sel->rs_candidates = bit_alloc(len, M_RIO, M_WAITOK);
+	sel->rs_indices = mallocarray(len, sizeof(u_int), M_RIO, M_WAITOK);
+	sel->rs_len = len;
+	sel->rs_min = UINT_MAX;
+	sel->rs_n = 0;
+}
+
+static inline void
+rio_selector_reset(struct rio_selector *sel, struct rio_softc *sc)
+{
+	u_int stop = sel->rs_len - 1;
+
+	bit_nclear(sel->rs_empty, 0, stop);
+	bit_nclear(sel->rs_affine, 0, stop);
+	bit_nclear(sel->rs_minimum, 0, stop);
+	sel->rs_min = UINT_MAX;
+	sel->rs_n = 0;
+}
+
+#if 0
+static inline void
+dump_bits(bitstr_t *bits, size_t len)
+{
+	ssize_t count;
+	u_int i;
+
+	bit_count(bits, 0, len, &count);
+	printf("%s: len=%zu count=%zd\n", __func__, len, count);
+	bit_foreach(bits, len, i) {
+		printf("%s: bit %u set\n", __func__, i);
+	}
+}
+#endif
+
+static inline void
+rio_selector_insert(struct rio_selector *sel, u_int qlen, bool affine)
+{
+	u_int idx = sel->rs_n++;
+
+	if (qlen == 0) {
+		bit_set(sel->rs_empty, idx);
+	}
+	if (affine) {
+		bit_set(sel->rs_affine, idx);
+	}
+	if (qlen == sel->rs_min) {
+		bit_set(sel->rs_minimum, idx);
+	} else if (qlen < sel->rs_min) {
+		sel->rs_min = qlen;
+		bit_nclear(sel->rs_minimum, 0, idx);
+		bit_set(sel->rs_minimum, idx);
+	}
+}
+
+static inline void
+rio_selector_destroy(struct rio_selector *sel)
+{
+	free(sel->rs_empty, M_RIO);
+	free(sel->rs_affine, M_RIO);
+	free(sel->rs_minimum, M_RIO);
+	free(sel->rs_candidates, M_RIO);
+	free(sel->rs_indices, M_RIO);
+}
+
+struct rio_src_scheduler {
+	struct rio_selector	rss_sel;
+	struct mtx	rss_lock;
+	u_int		*rss_affscore;	/* affinity scores */
+	int		rss_phase;
+};
+
+static void rio_src_scheduler_init(struct rio_src_scheduler *);
+static void rio_src_scheduler_destroy(struct rio_src_scheduler *);
+
 typedef int rio_src_scheduler_f(struct rio_softc *);
 
 /*
@@ -104,11 +195,22 @@ typedef int rio_src_scheduler_f(struct rio_softc *);
  *
  * For implementation utility and observability, see qmath(3) and stats(3).
  */
-static rio_src_scheduler_f rio_src_scheduler_none;
+static rio_src_scheduler_f rio_src_scheduler_soft_affinity;
+static rio_src_scheduler_f rio_src_scheduler_least_loaded;
+static rio_src_scheduler_f rio_src_scheduler_round_robin;
+static rio_src_scheduler_f rio_src_scheduler_local_flow;
 
 static rio_src_scheduler_f *rio_src_policies[] = {
-	[RIO_POLICY_NONE] = &rio_src_scheduler_none,
+	[RIO_POLICY_SOFT_AFFINITY] = rio_src_scheduler_soft_affinity,
+	[RIO_POLICY_LEAST_LOADED] = rio_src_scheduler_least_loaded,
+	[RIO_POLICY_ROUND_ROBIN] = rio_src_scheduler_round_robin,
+	[RIO_POLICY_LOCAL_FLOW] = rio_src_scheduler_local_flow,
 };
+
+#if 0 /* TODO */
+/* custom policy configuration */
+#define RIO_POLICY_CUSTOM		UINT_MAX
+#endif
 
 static SYSCTL_NODE(_kern_rio, OID_AUTO, flow, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
     "RIO per-CPU flow configuration");
@@ -282,6 +384,7 @@ struct rio_softc {
 	enum rio_status	sc_status;	/* softc/process status */
 	struct sx	sc_status_lock;	/* block status change while issuing */
 	struct mtx	sc_issuer_lock;	/* for submission dequeue accounting */
+	struct rio_src_scheduler	sc_sched;	/* submit scheduler */
 	/* TODO: flags? counters? */
 	struct rio_config	sc_config;
 	/*
@@ -300,9 +403,11 @@ rio_open(struct rio_softc **scp)
 	struct rio_softc *sc;
 
 	sc = malloc(sizeof(*sc), M_RIO, M_WAITOK | M_ZERO);
+	rio_src_scheduler_init(&sc->sc_sched);
 	mtx_lock(&rio_shutdown_lock);
 	if (rio_shutdown_pending) {
 		mtx_unlock(&rio_shutdown_lock);
+		rio_src_scheduler_destroy(&sc->sc_sched);
 		free(sc, M_RIO);
 		return (ESHUTDOWN);
 	}
@@ -327,6 +432,7 @@ rio_close(struct rio_softc *sc)
 	mtx_unlock(&rio_shutdown_lock);
 	sx_destroy(&sc->sc_status_lock);
 	mtx_destroy(&sc->sc_issuer_lock);
+	rio_src_scheduler_destroy(&sc->sc_sched);
 	free(sc, M_RIO);
 }
 
@@ -1935,116 +2041,6 @@ rio_vmspace_exit(struct vmspace *vm)
 	free(waff, M_RIO);
 }
 
-/* TODO: src/flow schedulers deep dive */
-/* XXX: this is a potentially confusing name */
-static int
-rio_src_scheduler_none(struct rio_softc *sc)
-{
-	struct rio_src *src;
-	struct rio_flow *flow;
-	struct rio_issuer *issuer;
-
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
-	/* Try the local flow first. */
-	flow = DPCPU_PTR(rio_flow);
-	issuer = &flow->rf_issuer;
-	/* TODO: policy-based queue depth, spread */
-	rio_issuer_enqueue(issuer, src);
-	return (0);
-}
-
-/*
- * The selector picks a candidate given a criteria and a phase offset.
- * It is used to select a worker that should minimize request latency.
- */
-struct rio_selector {
-	bitstr_t	*rs_empty;
-	bitstr_t	*rs_affine;
-	bitstr_t	*rs_minimum;
-	bitstr_t	*rs_candidates;
-	bitstr_t	*rs_vmspace_waff;
-	u_int		*rs_indices;
-	u_int		rs_len;
-	u_int		rs_min;
-	u_int		rs_n;
-};
-
-static inline void
-rio_selector_init(struct rio_selector *sel, u_int len)
-{
-	sel->rs_empty = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_affine = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_minimum = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_candidates = bit_alloc(len, M_RIO, M_WAITOK);
-	sel->rs_indices = mallocarray(len, sizeof(u_int), M_RIO, M_WAITOK);
-	sel->rs_len = len;
-	sel->rs_min = UINT_MAX;
-	sel->rs_n = 0;
-	sel->rs_vmspace_waff = NULL;
-}
-
-static inline void
-rio_selector_reset(struct rio_selector *sel, struct rio_srcio *srcio)
-{
-	u_int stop = sel->rs_len - 1;
-
-	bit_nclear(sel->rs_empty, 0, stop);
-	bit_nclear(sel->rs_affine, 0, stop);
-	bit_nclear(sel->rs_minimum, 0, stop);
-	sel->rs_min = UINT_MAX;
-	sel->rs_n = 0;
-	sel->rs_vmspace_waff = srcio->rs_sc->sc_vmspace->vm_rio;
-	MPASS(sel->rs_vmspace_waff != NULL);
-}
-
-#if 0
-static inline void
-dump_bits(bitstr_t *bits, size_t len)
-{
-	ssize_t count;
-	u_int i;
-
-	bit_count(bits, 0, len, &count);
-	printf("%s: len=%zu count=%zd\n", __func__, len, count);
-	bit_foreach(bits, len, i) {
-		printf("%s: bit %u set\n", __func__, i);
-	}
-}
-#endif
-
-static inline void
-rio_selector_insert(struct rio_selector *sel, struct rio_worker *worker)
-{
-	u_int idx = sel->rs_n++;
-	/* XXX: Unlocked, but it's probably good enough. */
-	u_int qlen = worker->rw_len;
-
-	if (qlen == 0) {
-		bit_set(sel->rs_empty, idx);
-	}
-	if (bit_test(sel->rs_vmspace_waff, worker->rw_id)) {
-		bit_set(sel->rs_affine, idx);
-	}
-	if (qlen == sel->rs_min) {
-		bit_set(sel->rs_minimum, idx);
-	} else if (qlen < sel->rs_min) {
-		sel->rs_min = qlen;
-		bit_nclear(sel->rs_minimum, 0, idx);
-		bit_set(sel->rs_minimum, idx);
-	}
-}
-
-static inline void
-rio_selector_destroy(struct rio_selector *sel)
-{
-	free(sel->rs_empty, M_RIO);
-	free(sel->rs_affine, M_RIO);
-	free(sel->rs_minimum, M_RIO);
-	free(sel->rs_candidates, M_RIO);
-	free(sel->rs_indices, M_RIO);
-}
-
 #define UIMAX(...) ({ \
 	u_int _vals[] = {__VA_ARGS__}; \
 	u_int _max = 0; \
@@ -2066,6 +2062,200 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 	}
 }
 
+static inline void
+rio_src_scheduler_init(struct rio_src_scheduler *sched)
+{
+	rio_selector_init(&sched->rss_sel, mp_ncpus);
+	sched->rss_affscore = mallocarray(mp_ncpus,
+	    sizeof(*sched->rss_affscore), M_RIO, M_WAITOK);
+	mtx_init(&sched->rss_lock, "rio src scheduler lock", NULL, MTX_DEF);
+}
+
+static inline void
+rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
+{
+	struct rio_selector *sel = &sched->rss_sel;
+	struct rio_softc *sc = src->rs_sc;
+	bitstr_t *waff = sc->sc_vmspace->vm_rio;
+	u_int cpu;
+
+	mtx_assert(&sched->rss_lock, MA_OWNED);
+	rio_selector_reset(sel, sc);
+	memset(sched->rss_affscore, 0, mp_ncpus * sizeof(*sched->rss_affscore));
+	CPU_FOREACH(cpu) {
+		struct rio_flow *flow = DPCPU_ID_PTR(cpu, rio_flow);
+		struct rio_issuer *issuer = &flow->rf_issuer;
+		const size_t start = cpu * rio_max_flow_workers;
+		const size_t end = start + rio_max_flow_workers;
+		/* XXX: Unlocked, but it's probably good enough. */
+		u_int qlen = issuer->ri_len;
+		u_int score = 0;
+		size_t id;
+
+		bit_foreach_at(waff, start, end, id) {
+			score++;
+		}
+		sched->rss_affscore[cpu] = score;
+		rio_selector_insert(sel, qlen, score > 0);
+	}
+	MPASS(sel->rs_min != UINT_MAX);
+}
+
+/* TODO: NUMA domain awareness */
+
+/*
+ * Source Scheduler: Soft Affinity
+ *
+ * The Soft Affinity scheduler peferentially selects the local flow until a high
+ * water mark is reached.  Then, the least busy remote flow with the most affine
+ * workers for the vmspace is selected.  Ties are resolved round-robin.
+ */
+static int
+rio_src_scheduler_soft_affinity(struct rio_softc *sc)
+{
+	struct rio_src_scheduler *sched = &sc->sc_sched;
+	struct rio_selector *sel = &sched->rss_sel;
+	struct rio_src *src;
+	struct rio_flow *flow;
+	/* TODO: policy */
+	u_int watermark;
+
+	/* Use the mean as our watermark for now. */
+	bit_count(sc->sc_vmspace->vm_rio, 0, rio_max_workers, &watermark);
+	watermark /= mp_ncpus;
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	flow = DPCPU_PTR(rio_flow);
+	if (flow->rf_issuer.ri_len > watermark) {
+		u_int max, count, cpu;
+		u_int stop = sel->rs_n - 1;
+
+		mtx_lock(&sched->rss_lock);
+		rio_src_scheduler_reset(sched, src);
+		max = 0;
+		bit_foreach(sel->rs_minimum, sel->rs_n, cpu) {
+			u_int score = sched->rss_affscore[cpu];
+
+			if (score < max || cpu == curcpu) {
+				continue;
+			}
+			if (score > max) {
+				max = score;
+				bit_nclear(sel->rs_candidates, 0, stop);
+			}
+			bit_set(sel->rs_candidates, cpu);
+		}
+		count = 0;
+		bit_foreach(sel->rs_candidates, sel->rs_n, cpu) {
+			sel->rs_indices[count++] = cpu;
+		}
+		MPASS(count > 0);
+		/* TODO: stride */
+		cpu = sel->rs_indices[sched->rss_phase++ % count];
+		mtx_unlock(&sched->rss_lock);
+		MPASS(cpu < mp_ncpus);
+		flow = DPCPU_ID_PTR(cpu, rio_flow);
+	}
+	rio_issuer_enqueue(&flow->rf_issuer, src);
+	return (0);
+}
+
+/*
+ * Source Scheduler: Least Loaded
+ *
+ * The Least Loaded scheduler selects the flow with the shallowest issuer queue.
+ * Ties are resolved round-robin from the flows with affine workers or from all
+ * flows if none are affine.
+ */
+static int
+rio_src_scheduler_least_loaded(struct rio_softc *sc)
+{
+	struct rio_src_scheduler *sched = &sc->sc_sched;
+	struct rio_selector *sel = &sched->rss_sel;
+	struct rio_src *src;
+	struct rio_flow *flow;
+	u_int count, cpu;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	mtx_lock(&sched->rss_lock);
+	rio_src_scheduler_reset(sched, src);
+	bit_and(sel->rs_affine, sel->rs_minimum, sel->rs_candidates, sel->rs_n);
+	count = 0;
+	bit_foreach(sel->rs_candidates, sel->rs_n, cpu) {
+		sel->rs_indices[count++] = cpu;
+	}
+	if (count == 0) {
+		bit_foreach(sel->rs_minimum, sel->rs_n, cpu) {
+			sel->rs_indices[count++] = cpu;
+		}
+	}
+	MPASS(count > 0);
+	/* TODO: stride */
+	cpu = sel->rs_indices[sched->rss_phase++ % count];
+	mtx_unlock(&sched->rss_lock);
+	MPASS(cpu < mp_ncpus);
+	flow = DPCPU_ID_PTR(cpu, rio_flow);
+	rio_issuer_enqueue(&flow->rf_issuer, src);
+	return (0);
+}
+
+/*
+ * Source Scheduler: Round Robin
+ *
+ * Flows are selected sequentially.  Why use many rule when one do trick?
+ */
+static int
+rio_src_scheduler_round_robin(struct rio_softc *sc)
+{
+	struct rio_src_scheduler *sched = &sc->sc_sched;
+	struct rio_src *src;
+	struct rio_flow *flow;
+	struct rio_issuer *issuer;
+	int phase;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	mtx_lock(&sched->rss_lock);
+	phase = sched->rss_phase++;
+	mtx_unlock(&sched->rss_lock);
+	/* TODO: stride */
+	flow = DPCPU_ID_PTR(phase % mp_ncpus, rio_flow);
+	issuer = &flow->rf_issuer;
+	rio_issuer_enqueue(issuer, src);
+	return (0);
+}
+
+/*
+ * Source Scheduler: Local Flow
+ *
+ * Only the local flow is selected.  There's no place like home.
+ */
+static int
+rio_src_scheduler_local_flow(struct rio_softc *sc)
+{
+	struct rio_src *src;
+	struct rio_flow *flow;
+	struct rio_issuer *issuer;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	flow = DPCPU_PTR(rio_flow);
+	issuer = &flow->rf_issuer;
+	rio_issuer_enqueue(issuer, src);
+	return (0);
+}
+
+/* TODO: custom policy scheduler */
+
+static inline void
+rio_src_scheduler_destroy(struct rio_src_scheduler *sched)
+{
+	rio_selector_destroy(&sched->rss_sel);
+	free(sched->rss_affscore, M_RIO);
+	mtx_destroy(&sched->rss_lock);
+}
+
 /*
  * The tricky bit is that we want to avoid frequent vmspace changes, so
  * workers need to be fed in such a way as to balance the load while at
@@ -2082,57 +2272,64 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
  * worker.  If there are no local workers with a queue depth below a policy-
  * defined threshold, the scheduler will repeat the process for remote workers.
  *
- * TODO: Implement the remote work policies for controlled behavior under load.
+ * TODO: Revise description to match the flow-first scheduling algorithm.
  *
  * We want to stay on the same CPU as the user thread accessing the IO buffers,
  * for cache locality.  Scheduling should select the local CPU issuer until
  * local workers are all busy.  But, we also want to utilize idle CPU time to
  * minimize latency and maximize throughput.  Optimizing the balance of these
  * priorities is the role of the policy.
- *
- * TODO: Utilize flow vnet affinity.
  */
-struct rio_scheduler {
-	struct rio_selector	rs_sel;
-	int	*rs_phase;	/* XXX: stale reads should be good enough */
+struct rio_srcio_scheduler {
+	struct rio_selector	rss_sel;
+	int	*rss_phase;	/* XXX: stale reads are good enough */
 };
 
 static inline void
-rio_scheduler_init(struct rio_scheduler *sched, struct rio_issuer *issuer)
+rio_srcio_scheduler_init(struct rio_srcio_scheduler *sched,
+    struct rio_issuer *issuer)
 {
-	sched->rs_phase = &issuer->ri_phase;
-	rio_selector_init(&sched->rs_sel, UIMAX(rio_flow_read_workers,
+	sched->rss_phase = &issuer->ri_phase;
+	rio_selector_init(&sched->rss_sel, UIMAX(rio_flow_read_workers,
 	    rio_flow_write_workers, rio_flow_sync_workers));
 	/* TODO: more worker classes? */
 }
 
 static inline void
-rio_scheduler_sockinit(struct rio_scheduler *sched, int *phasep)
+rio_srcio_scheduler_sockinit(struct rio_srcio_scheduler *sched, int *phasep)
 {
-	sched->rs_phase = phasep;
-	rio_selector_init(&sched->rs_sel, rio_flow_socket_workers);
+	sched->rss_phase = phasep;
+	rio_selector_init(&sched->rss_sel, rio_flow_socket_workers);
 }
 
 static inline void
-rio_scheduler_reset(struct rio_scheduler *sched, struct rio_worker *workers,
-    u_int len, struct rio_srcio *srcio)
+rio_srcio_scheduler_reset(struct rio_srcio_scheduler *sched,
+    struct rio_worker *workers, u_int len, struct rio_srcio *srcio)
 {
-	struct rio_selector *sel = &sched->rs_sel;
+	struct rio_selector *sel = &sched->rss_sel;
+	struct rio_softc *sc = srcio->rs_sc;
+	bitstr_t *waff = sc->sc_vmspace->vm_rio; /* worker affinity */
 
-	rio_selector_reset(sel, srcio);
+	rio_selector_reset(sel, sc);
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
+		struct rio_worker *worker = workers + i;
+		/* XXX: Unlocked, but it's probably good enough. */
+		u_int qlen = worker->rw_len;
+		bool affine = bit_test(waff, worker->rw_id);
+
 		/* TODO: consider which workers are running? */
-		rio_selector_insert(sel, workers + i);
+		rio_selector_insert(sel, qlen, affine);
 	}
 	MPASS(sel->rs_n == len);
 	MPASS(sel->rs_min != UINT_MAX);
 }
 
 static inline struct rio_worker *
-rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
+rio_srcio_scheduler_ideal(struct rio_srcio_scheduler *sched,
+    struct rio_worker *workers)
 {
-	struct rio_selector *sel = &sched->rs_sel;
+	struct rio_selector *sel = &sched->rss_sel;
 	u_int count, idx;
 
 	bit_and(sel->rs_empty, sel->rs_affine, sel->rs_candidates, sel->rs_n);
@@ -2143,13 +2340,14 @@ rio_scheduler_ideal(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_phase % count]);
+	return (workers + sel->rs_indices[*sched->rss_phase % count]);
 }
 
 static inline struct rio_worker *
-rio_scheduler_empty(struct rio_scheduler *sched, struct rio_worker *workers)
+rio_srcio_scheduler_empty(struct rio_srcio_scheduler *sched,
+    struct rio_worker *workers)
 {
-	struct rio_selector *sel = &sched->rs_sel;
+	struct rio_selector *sel = &sched->rss_sel;
 	u_int count, idx;
 
 	count = 0;
@@ -2159,13 +2357,14 @@ rio_scheduler_empty(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_phase % count]);
+	return (workers + sel->rs_indices[*sched->rss_phase % count]);
 }
 
 static inline struct rio_worker *
-rio_scheduler_affine(struct rio_scheduler *sched, struct rio_worker *workers)
+rio_srcio_scheduler_affine(struct rio_srcio_scheduler *sched,
+    struct rio_worker *workers)
 {
-	struct rio_selector *sel = &sched->rs_sel;
+	struct rio_selector *sel = &sched->rss_sel;
 	u_int stop = sel->rs_n - 1;
 	u_int min, count, idx;
 
@@ -2190,13 +2389,14 @@ rio_scheduler_affine(struct rio_scheduler *sched, struct rio_worker *workers)
 	if (count == 0) {
 		return (NULL);
 	}
-	return (workers + sel->rs_indices[*sched->rs_phase % count]);
+	return (workers + sel->rs_indices[*sched->rss_phase % count]);
 }
 
 static inline struct rio_worker *
-rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
+rio_srcio_scheduler_depth(struct rio_srcio_scheduler *sched,
+    struct rio_worker *workers)
 {
-	struct rio_selector *sel = &sched->rs_sel;
+	struct rio_selector *sel = &sched->rss_sel;
 	u_int count, idx;
 
 	/* TODO: policy depth threshold to consider remote workers */
@@ -2205,31 +2405,32 @@ rio_scheduler_depth(struct rio_scheduler *sched, struct rio_worker *workers)
 		sel->rs_indices[count++] = idx;
 	}
 	MPASS(count > 0);
-	return (workers + sel->rs_indices[*sched->rs_phase % count]);
+	return (workers + sel->rs_indices[*sched->rss_phase % count]);
 }
 
 /* Try selecting the least-busy affine worker. */
 static inline struct rio_worker *
-rio_scheduler_select_worker(struct rio_scheduler *sched,
+rio_srcio_scheduler_select_worker(struct rio_srcio_scheduler *sched,
     struct rio_worker *workers, u_int len, struct rio_srcio *srcio)
 {
 	struct rio_worker *worker;
 
-	rio_scheduler_reset(sched, workers, len, srcio);
-	if ((worker = rio_scheduler_ideal(sched, workers)) != NULL) {
+	rio_srcio_scheduler_reset(sched, workers, len, srcio);
+	if ((worker = rio_srcio_scheduler_ideal(sched, workers)) != NULL) {
 		return (worker);
 	}
-	if ((worker = rio_scheduler_empty(sched, workers)) != NULL) {
+	if ((worker = rio_srcio_scheduler_empty(sched, workers)) != NULL) {
 		return (worker);
 	}
-	if ((worker = rio_scheduler_affine(sched, workers)) != NULL) {
+	if ((worker = rio_srcio_scheduler_affine(sched, workers)) != NULL) {
 		return (worker);
 	}
-	return (rio_scheduler_depth(sched, workers));
+	return (rio_srcio_scheduler_depth(sched, workers));
 }
 
 static inline void
-rio_scheduler_schedule(struct rio_scheduler *sched, struct rio_srcio *srcio)
+rio_srcio_scheduler_schedule(struct rio_srcio_scheduler *sched,
+    struct rio_srcio *srcio)
 {
 	struct rio_flow *flow;
 	struct rio_worker *workers, *worker;
@@ -2238,14 +2439,14 @@ rio_scheduler_schedule(struct rio_scheduler *sched, struct rio_srcio *srcio)
 	/* Try local flow first. */
 	flow = DPCPU_PTR(rio_flow);
 	workers = rio_flow_classify(flow, srcio, &len);
-	worker = rio_scheduler_select_worker(sched, workers, len, srcio);
+	worker = rio_srcio_scheduler_select_worker(sched, workers, len, srcio);
 	rio_worker_enqueue(worker, srcio);
 }
 
 static inline void
-rio_scheduler_destroy(struct rio_scheduler *sched)
+rio_srcio_scheduler_destroy(struct rio_srcio_scheduler *sched)
 {
-	rio_selector_destroy(&sched->rs_sel);
+	rio_selector_destroy(&sched->rss_sel);
 }
 
 /* TODO: remote flow selection process */
@@ -2272,23 +2473,23 @@ rio_scheduler_destroy(struct rio_scheduler *sched)
  */
 
 struct rio_socket_issuer {
-	struct rio_scheduler	rsi_sched;
-	struct mtx		rsi_lock;
-	int			rsi_phase;
+	struct rio_srcio_scheduler	rsi_sched;
+	struct mtx	rsi_lock;
+	int		rsi_phase;
 };
 DPCPU_DEFINE_STATIC(struct rio_socket_issuer, rio_socket_issuer);
 
 static inline void
 rio_socket_issuer_init(struct rio_socket_issuer *rsi)
 {
-	rio_scheduler_sockinit(&rsi->rsi_sched, &rsi->rsi_phase);
+	rio_srcio_scheduler_sockinit(&rsi->rsi_sched, &rsi->rsi_phase);
 	mtx_init(&rsi->rsi_lock, "rio socket issuer lock", NULL, MTX_DEF);
 }
 
 static inline void
 rio_socket_issuer_destroy(struct rio_socket_issuer *rsi)
 {
-	rio_scheduler_destroy(&rsi->rsi_sched);
+	rio_srcio_scheduler_destroy(&rsi->rsi_sched);
 	mtx_destroy(&rsi->rsi_lock);
 }
 
@@ -2311,8 +2512,8 @@ rio_socket_schedule(struct socket *so, sb_which which)
 	rse = rio_srcio_ext(srcio);
 	flow = DPCPU_ID_PTR(rse->rse_cpu, rio_flow);
 	mtx_lock(&rsi->rsi_lock);
-	worker = rio_scheduler_select_worker(&rsi->rsi_sched, flow->rf_socket,
-	    rio_flow_socket_workers, srcio);
+	worker = rio_srcio_scheduler_select_worker(&rsi->rsi_sched,
+	    flow->rf_socket, rio_flow_socket_workers, srcio);
 	/* TODO: how does flow affinity fit in to remote worker selection? */
 	mtx_unlock(&rsi->rsi_lock);
 	rio_worker_enqueue(worker, srcio);
@@ -2333,7 +2534,7 @@ sorio_rcv(void *context, int pending __unused)
 static void
 rio_issuer_thread(void *arg)
 {
-	struct rio_scheduler sched;
+	struct rio_srcio_scheduler sched;
 	struct rio_issuer_arg *ria = arg;
 	struct rio_issuer *self = ria->ria_issuer;
 	struct thread *td = curthread;
@@ -2341,7 +2542,7 @@ rio_issuer_thread(void *arg)
 	thread_lock(td);
 	sched_bind(td, self->ri_cpu);
 	thread_unlock(td);
-	rio_scheduler_init(&sched, self);
+	rio_srcio_scheduler_init(&sched, self);
 
 	for (;;) {
 		struct rio_src *src;
@@ -2459,12 +2660,12 @@ next:
 			}
 schedule:
 			/* Schedule the io on a worker. */
-			rio_scheduler_schedule(&sched, srcio);
+			rio_srcio_scheduler_schedule(&sched, srcio);
 		}
 		sx_sunlock(&sc->sc_status_lock);
 		rio_issuer_enqueue(self, src);
 	}
-	rio_scheduler_destroy(&sched);
+	rio_srcio_scheduler_destroy(&sched);
 	free_unr(self->ri_unr, rio_issuer_arg_idx(ria));
 	mtx_lock(&self->ri_lock);
 	self->ri_threads--;
