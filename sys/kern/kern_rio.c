@@ -1940,14 +1940,15 @@ rio_worker_dequeue(struct rio_worker *worker, struct rio_srcio **srciop)
 	}
 	srcio = STAILQ_FIRST(&worker->rw_srcios);
 	if (__predict_false(srcio == NULL)) {
-		if (error == EWOULDBLOCK) {
+		if (error == 0) {
+			/* The idle worker must switch vmspace. */
+			*srciop = NULL;
+		} else {
+			/* The idle worker timed out and must exit. */
+			MPASS(error == EWOULDBLOCK);
 			worker->rw_running = false;
 		}
 		mtx_unlock(&worker->rw_lock);
-		/*
-		 * If error is 0 we were signaled and the queue is empty.
-		 * Returning 0 without setting *srciop means switch vmspace.
-		 */
 		return (error);
 	}
 	STAILQ_REMOVE_HEAD(&worker->rw_srcios, rs_srcios);
