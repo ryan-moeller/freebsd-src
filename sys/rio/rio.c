@@ -15,6 +15,7 @@
 #include <sys/condvar.h>
 #include <sys/conf.h>
 #include <sys/counter.h>
+#include <sys/exterrvar.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
 #include <sys/kernel.h>
@@ -298,7 +299,7 @@ rio_open(struct rio_softc **scp)
 		mtx_unlock(&rio_shutdown_lock);
 		rio_src_scheduler_destroy(&sc->sc_sched);
 		free(sc, M_RIO);
-		return (ESHUTDOWN);
+		return (EXTERROR(ESHUTDOWN, "system shutting down"));
 	}
 	sx_init(&sc->sc_status_lock, "rio softc status lock");
 	mtx_init(&sc->sc_issuer_lock, "rio softc issuer lock", NULL, MTX_DEF);
@@ -590,20 +591,23 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 
 	MPASS(fp->f_type == DTYPE_SHM);
 	shmfd = fp->f_data;
-	if (shmfd->shm_path != NULL ||
-	    conf->rio_policy_id >= nitems(rio_src_policies)) {
+	if (shmfd->shm_path != NULL) {
+		return (EXTERROR(EINVAL, "expected anonymous shm"));
+	}
+	if (conf->rio_policy_id >= nitems(rio_src_policies)) {
 		/* TODO: custom policy */
-		return (EINVAL);
+		return (EXTERROR(EINVAL, "invalid policy id"));
 	}
 	if ((error = rio_open(&sc)) != 0) {
 		return (error);
 	}
 	memcpy(&sc->sc_config, conf, sizeof(*conf));
 	size = rio_config_size(conf);
-	/* TODO: Will mmap enforce size limits for us? */
+	/* The size is validated by shm_map. */
 	if ((error = shm_map(fp, size, 0, (void **)&sc->sc_rio)) != 0) {
 		rio_close(sc);
-		return (error);
+		/* TODO: shm_map could set better error info */
+		return (EXTERROR(error, "shm_map failed"));
 	}
 	sc->sc_cred = crhold(active_cred); /* XXX: for all IO on this ring */
 	sc->sc_proc = td->td_proc;
@@ -645,12 +649,10 @@ rio_submit(struct file *fp, struct thread *td)
 	MPASS(fp->f_type == DTYPE_SHM);
 	shmfd = fp->f_data;
 	if (__predict_false((sc = shmfd->shm_rio) == NULL)) {
-		printf("%s: no rio\n", __func__);
-		return (ENOTTY);
+		return (EXTERROR(ENOTTY, "rio is not configured"));
 	}
 	if (__predict_false(sc->sc_proc != td->td_proc)) {
-		printf("%s: wrong proc\n", __func__);
-		return (EDOOFUS);
+		return (EXTERROR(EDOOFUS, "rio is not transferrable"));
 	}
 	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
 	return (schedule(sc));
