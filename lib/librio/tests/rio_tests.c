@@ -219,6 +219,7 @@ ATF_TC_BODY(saturation, tc)
 	rio_t rio = NULL;
 	int fd, q, s, c;
 
+	ATF_REQUIRE(CQLEN <= SQLEN);
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
 	ATF_REQUIRE((fd = open("testfile", O_CREAT | O_RDWR, 0444)) != -1);
 
@@ -229,20 +230,29 @@ ATF_TC_BODY(saturation, tc)
 	/* TODO: Test with multiple threads and different qlens/ncb. */
 	q = s = c = 0;
 	while (s < limit) {
+		ATF_REQUIRE(q == s);
+		ATF_REQUIRE(s == c);
 		/* Non-blocking enqueue, submit when full. */
-		while (rio_write(rio, &iocb, &deadline) != -1) {
-			q++;
+		for (; q - s < SQLEN - 1; q++) {
+			ATF_CHECK(rio_write(rio, &iocb, &deadline) != -1);
 		}
-		ATF_CHECK_INTEQ(ETIMEDOUT, errno);
-		/* Submission queue full. */
+		if (s == 0) {
+			/* Submission queue full on first iteration. */
+			ATF_CHECK(rio_write(rio, &iocb, &deadline) == -1);
+			ATF_CHECK_INTEQ(errno, ETIMEDOUT);
+		}
 		ATF_CHECK(rio_submit(rio) != -1);
 		s = q;
-		/* Blocking enqueue, submit when full again. */
+		/*
+		 * Blocking enqueue, submit when full again.  The completion
+		 * ring size will make space available in the submission ring.
+		 */
 		for (; q - s < CQLEN - 1; q++) {
 			ATF_CHECK(rio_fsync(rio, &iocb, NULL) != -1);
 		}
 		/* Submissions full. */
-		ATF_CHECK_ERRNO(ETIMEDOUT, rio_fsync(rio, &iocb, &deadline));
+		ATF_CHECK(rio_fsync(rio, &iocb, &deadline) == -1);
+		ATF_CHECK_INTEQ(errno, ETIMEDOUT);
 		/* Can submit, but we're immediately kicked off the issuer. */
 		ATF_CHECK(rio_submit(rio) != -1);
 		s = q;
