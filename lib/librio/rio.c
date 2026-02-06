@@ -9,6 +9,7 @@
 #include <sys/umtx.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -51,7 +52,8 @@ wait32(const struct ck_ec_wait_state *state __unused, const uint32_t *address,
 		int error = errno;
 
 		/* TODO: How to handle errors? EINTR? */
-		(void)error;
+		fprintf(stderr, "%s: %s (%d)\n", __func__, strerror(error),
+		    error);
 	}
 }
 
