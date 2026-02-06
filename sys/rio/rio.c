@@ -1089,11 +1089,11 @@ rio_bio_childdone(struct bio *bp)
 		atomic_cmpset_int(&pbp->bio_error, 0, bp->bio_error);
 	}
 	atomic_add_64(&pbp->bio_completed, bp->bio_completed);
-	rio_bio_destroy(bp);
 	inbed = atomic_fetchadd_int(&pbp->bio_inbed, 1) + 1;
 	if (pbp->bio_children == inbed) {
 		pbp->bio_done(pbp);
 	}
+	rio_bio_destroy(bp);
 }
 
 static void
@@ -1104,8 +1104,8 @@ rio_bio_complete(struct bio *bp)
 
 	kiocb->rio_status = bp->bio_completed;
 	kiocb->rio_error = bp->bio_error;
-	rio_bio_destroy(bp);
 	rio_srcio_complete(srcio);
+	rio_bio_destroy(bp);
 }
 
 /* context for cdev bio ops */
