@@ -517,6 +517,8 @@ ATF_TC_CLEANUP(cdev, tc)
 	md_cleanup();
 }
 
+/* TODO: test different policies */
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, create_destroy);
