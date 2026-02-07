@@ -95,7 +95,14 @@ struct rio_src_scheduler {
 static void rio_src_scheduler_init(struct rio_src_scheduler *);
 static void rio_src_scheduler_destroy(struct rio_src_scheduler *);
 
-typedef int rio_src_scheduler_f(struct rio_softc *);
+struct rio_src {
+	struct rio_softc	*rs_sc;		/* io source context */
+	u_int			rs_attention;	/* issuer credits */
+	STAILQ_ENTRY(rio_src)	rs_srcs;
+};
+STAILQ_HEAD(rio_srcs, rio_src);
+
+typedef u_int rio_src_scheduler_f(struct rio_src *);
 
 /*
  * TODO: Improve the set of useful scheduling policies.
@@ -650,12 +657,13 @@ rio_configure(const struct rio_config *conf, struct file *fp, struct thread *td,
 	return (0);
 }
 
+static void rio_schedule(struct rio_softc *);
+
 static int
 rio_submit(struct file *fp, struct thread *td)
 {
 	struct shmfd *shmfd;
 	struct rio_softc *sc;
-	rio_src_scheduler_f *schedule;
 
 	MPASS(fp->f_type == DTYPE_SHM);
 	shmfd = fp->f_data;
@@ -665,8 +673,8 @@ rio_submit(struct file *fp, struct thread *td)
 	if (__predict_false(sc->sc_proc != td->td_proc)) {
 		return (EXTERROR(EDOOFUS, "rio is not transferrable"));
 	}
-	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
-	return (schedule(sc));
+	rio_schedule(sc);
+	return (0);
 }
 
 int
@@ -682,13 +690,6 @@ rio_ioctl(struct file *fp, u_long com, void *data, struct ucred *active_cred,
 		return (ENOTTY);
 	}
 }
-
-struct rio_src {
-	struct rio_softc	*rs_sc;		/* io source context */
-	u_int			rs_attention;	/* issuer credits */
-	STAILQ_ENTRY(rio_src)	rs_srcs;
-};
-STAILQ_HEAD(rio_srcs, rio_src);
 
 static uma_zone_t rio_src_zone;
 
@@ -2073,12 +2074,12 @@ rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
  * water mark is reached.  Then, the least busy remote flow with the most affine
  * workers for the vmspace is selected.  Ties are resolved round-robin.
  */
-static int
-rio_src_scheduler_soft_affinity(struct rio_softc *sc)
+static u_int
+rio_src_scheduler_soft_affinity(struct rio_src *src)
 {
+	struct rio_softc *sc = src->rs_sc;
 	struct rio_src_scheduler *sched = &sc->sc_sched;
 	struct rio_selector *sel = &sched->rss_sel;
-	struct rio_src *src;
 	struct rio_flow *flow;
 	/* TODO: policy */
 	u_int watermark;
@@ -2086,8 +2087,6 @@ rio_src_scheduler_soft_affinity(struct rio_softc *sc)
 	/* Use the mean as our watermark for now. */
 	bit_count(sc->sc_vmspace->vm_rio, 0, rio_max_workers, &watermark);
 	watermark /= mp_ncpus;
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
 	flow = DPCPU_PTR(rio_flow);
 	if (flow->rf_issuer.ri_len > watermark) {
 		u_int max, count, cpu;
@@ -2116,11 +2115,9 @@ rio_src_scheduler_soft_affinity(struct rio_softc *sc)
 		/* TODO: stride */
 		cpu = sel->rs_indices[sched->rss_phase++ % count];
 		mtx_unlock(&sched->rss_lock);
-		MPASS(cpu < mp_ncpus);
-		flow = DPCPU_ID_PTR(cpu, rio_flow);
+		return (cpu);
 	}
-	rio_issuer_enqueue(&flow->rf_issuer, src);
-	return (0);
+	return (curcpu);
 }
 
 /*
@@ -2130,17 +2127,13 @@ rio_src_scheduler_soft_affinity(struct rio_softc *sc)
  * Ties are resolved round-robin from the flows with affine workers or from all
  * flows if none are affine.
  */
-static int
-rio_src_scheduler_least_loaded(struct rio_softc *sc)
+static u_int
+rio_src_scheduler_least_loaded(struct rio_src *src)
 {
-	struct rio_src_scheduler *sched = &sc->sc_sched;
+	struct rio_src_scheduler *sched = &src->rs_sc->sc_sched;
 	struct rio_selector *sel = &sched->rss_sel;
-	struct rio_src *src;
-	struct rio_flow *flow;
 	u_int count, cpu;
 
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
 	mtx_lock(&sched->rss_lock);
 	rio_src_scheduler_reset(sched, src);
 	bit_and(sel->rs_affine, sel->rs_minimum, sel->rs_candidates, sel->rs_n);
@@ -2157,10 +2150,7 @@ rio_src_scheduler_least_loaded(struct rio_softc *sc)
 	/* TODO: stride */
 	cpu = sel->rs_indices[sched->rss_phase++ % count];
 	mtx_unlock(&sched->rss_lock);
-	MPASS(cpu < mp_ncpus);
-	flow = DPCPU_ID_PTR(cpu, rio_flow);
-	rio_issuer_enqueue(&flow->rf_issuer, src);
-	return (0);
+	return (cpu);
 }
 
 /*
@@ -2168,25 +2158,17 @@ rio_src_scheduler_least_loaded(struct rio_softc *sc)
  *
  * Flows are selected sequentially.  Why use many rule when one do trick?
  */
-static int
-rio_src_scheduler_round_robin(struct rio_softc *sc)
+static u_int
+rio_src_scheduler_round_robin(struct rio_src *src)
 {
-	struct rio_src_scheduler *sched = &sc->sc_sched;
-	struct rio_src *src;
-	struct rio_flow *flow;
-	struct rio_issuer *issuer;
+	struct rio_src_scheduler *sched = &src->rs_sc->sc_sched;
 	int phase;
 
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
 	mtx_lock(&sched->rss_lock);
 	phase = sched->rss_phase++;
 	mtx_unlock(&sched->rss_lock);
 	/* TODO: stride */
-	flow = DPCPU_ID_PTR(phase % mp_ncpus, rio_flow);
-	issuer = &flow->rf_issuer;
-	rio_issuer_enqueue(issuer, src);
-	return (0);
+	return (phase % mp_ncpus);
 }
 
 /*
@@ -2194,19 +2176,10 @@ rio_src_scheduler_round_robin(struct rio_softc *sc)
  *
  * Only the local flow is selected.  There's no place like home.
  */
-static int
-rio_src_scheduler_local_flow(struct rio_softc *sc)
+static u_int
+rio_src_scheduler_local_flow(struct rio_src *src __unused)
 {
-	struct rio_src *src;
-	struct rio_flow *flow;
-	struct rio_issuer *issuer;
-
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
-	flow = DPCPU_PTR(rio_flow);
-	issuer = &flow->rf_issuer;
-	rio_issuer_enqueue(issuer, src);
-	return (0);
+	return (curcpu);
 }
 
 /* TODO: custom policy scheduler */
@@ -2217,6 +2190,23 @@ rio_src_scheduler_destroy(struct rio_src_scheduler *sched)
 	rio_selector_destroy(&sched->rss_sel);
 	free(sched->rss_affscore, M_RIO);
 	mtx_destroy(&sched->rss_lock);
+}
+
+static inline void
+rio_schedule(struct rio_softc *sc)
+{
+	struct rio_src *src;
+	struct rio_flow *flow;
+	rio_src_scheduler_f *schedule;
+	u_int cpu;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
+	cpu = schedule(src);
+	MPASS(cpu < mp_ncpus);
+	flow = DPCPU_ID_PTR(cpu, rio_flow);
+	rio_issuer_enqueue(&flow->rf_issuer, src);
 }
 
 /*
@@ -2443,15 +2433,14 @@ rio_socket_schedule(struct socket *so, sb_which which)
 	RIO_SOCK_BUF_LOCK(so, which);
 	MPASS((sb->sb_flags & SB_RIO_RUNNING) != 0);
 	srcio = rio_sockbuf_takefirst(sb);
-	MPASS(srcio != NULL);
 	RIO_SOCK_BUF_UNLOCK(so, which);
+	MPASS(srcio != NULL);
 	rse = rio_srcio_ext(srcio);
 	/* TODO: Utilize policy/vnet affinity for overflow to remote workers? */
 	flow = DPCPU_ID_PTR(rse->rse_cpu, rio_flow);
 	mtx_lock(&rsi->rsi_lock);
 	worker = rio_srcio_scheduler_select_worker(&rsi->rsi_sched,
 	    flow->rf_socket, rio_flow_socket_workers, srcio);
-	/* TODO: how does flow affinity fit in to remote worker selection? */
 	mtx_unlock(&rsi->rsi_lock);
 	rio_worker_enqueue(worker, srcio);
 }
