@@ -74,11 +74,22 @@ MALLOC_DEFINE(M_RIO, "rio", "rio data structures");
 static SYSCTL_NODE(_kern, OID_AUTO, rio, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
     "Ring IO configuration");
 
+/*
+ * We want to stay on the same CPU as the user thread accessing the IO buffers,
+ * for cache locality.  Source (flow) scheduling should select the local CPU
+ * issuer until local workers are all busy.  But, we also want to utilize idle
+ * CPU time to minimize latency and maximize throughput.  Optimizing the balance
+ * of these priorities is the role of the policy.  Different policies make
+ * tradeoffs to optimize for a particular objective.
+ *
+ * XXX: Scheduling avoids locking every issuer so may see stale reads, but it's
+ * good enough for the purpose of load balancing.
+ */
 struct rio_src_scheduler {
 	struct rio_selector	rss_sel;
 	struct mtx	rss_lock;
 	u_int		*rss_affscore;	/* affinity scores */
-	int		rss_phase;
+	int		rss_phase;	/* round-robin index */
 };
 
 static void rio_src_scheduler_init(struct rio_src_scheduler *);
@@ -87,7 +98,7 @@ static void rio_src_scheduler_destroy(struct rio_src_scheduler *);
 typedef int rio_src_scheduler_f(struct rio_softc *);
 
 /*
- * TODO: come up with a set of useful scheduling policies.
+ * TODO: Improve the set of useful scheduling policies.
  *
  * Useful means different things, so policies are defined broadly by two
  * parameters: the behavior, and the configuration.
@@ -96,7 +107,7 @@ typedef int rio_src_scheduler_f(struct rio_softc *);
  *
  * Configuration is split across two planes: user and system.  User policy
  * config is controlled by ioctls, system policy config is controlled by
- * sysctls.
+ * sysctls and tunables.
  *
  * How should policy be defined?  An nvlist would be very extensible for sure,
  * or simply per-policy ioctls.
@@ -266,7 +277,6 @@ struct rio_softc {
 	struct proc	*sc_proc;	/* user process */
 	struct vmspace	*sc_vmspace;	/* user process vmspace */
 	vm_offset_t	sc_urio;	/* user address of SHM object */
-	/* TODO: policy metadata */
 	struct task	sc_destroy_task;/* destruction task */
 	enum rio_status	sc_status;	/* softc/process status */
 	struct sx	sc_status_lock;	/* block status change while issuing */
@@ -274,6 +284,7 @@ struct rio_softc {
 	struct rio_src_scheduler	sc_sched;	/* submit scheduler */
 	/* TODO: flags? counters? */
 	struct rio_config	sc_config;
+	/* TODO: policy metadata */
 	/*
 	 * XXX: As a workaround for not having context in wake32, we have to
 	 * embed the CK event counter ops and mode in every softc so the ops
@@ -2040,7 +2051,6 @@ rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
 		struct rio_issuer *issuer = &flow->rf_issuer;
 		const size_t start = cpu * rio_max_flow_workers;
 		const size_t end = start + rio_max_flow_workers;
-		/* XXX: Unlocked, but it's probably good enough. */
 		u_int qlen = issuer->ri_len;
 		u_int score = 0;
 		size_t id;
@@ -2217,25 +2227,24 @@ rio_src_scheduler_destroy(struct rio_src_scheduler *sched)
  * How expensive is a vmspace switch?  The costly part is pmap_activate(), which
  * does TLB invalidation IPIs.
  *
- * To improve vmspace affinity, we save the user process pointer for the tail of
- * the worker's IO queue as a hint for worker affinity.  The scheduler first
- * checks the local workers for an idle affine worker.  Failing success in the
- * first pass, the scheduler then tries to select any idle local worker.  If the
- * second pass fails, the scheduler tries to select the least-busy affine local
- * worker.  If there are no local workers with a queue depth below a policy-
- * defined threshold, the scheduler will repeat the process for remote workers.
+ * To improve vmspace affinity, we keep a bitmap of affine workers in every
+ * vmspace.  The srcio (worker) scheduler first checks the flow's workers for an
+ * idle affine worker.  Failing success in the first pass, the scheduler then
+ * tries to select any idle worker in the flow.  If the second pass fails, the
+ * scheduler tries to select the least-busy affine local worker.
  *
- * TODO: Revise description to match the flow-first scheduling algorithm.
+ * XXX: Scheduling avoids locking every worker so may see stale reads, but it's
+ * good enough for the purpose of load balancing.
  *
- * We want to stay on the same CPU as the user thread accessing the IO buffers,
- * for cache locality.  Scheduling should select the local CPU issuer until
- * local workers are all busy.  But, we also want to utilize idle CPU time to
- * minimize latency and maximize throughput.  Optimizing the balance of these
- * priorities is the role of the policy.
+ * TODO: The srcio schedulers currently only utilize the local flow, so a source
+ * submit with a full submission ring gets scheduled to one flow and will not
+ * utilize available capacity from other flows.  The scheduling algorithm needs
+ * to be extended with overflow to remote workers in the issuing stage, not just
+ * at source ring submit.
  */
 struct rio_srcio_scheduler {
 	struct rio_selector	rss_sel;
-	int	*rss_phase;	/* XXX: stale reads are good enough */
+	int	*rss_phase;	/* round-robin index */
 };
 
 static inline void
@@ -2267,11 +2276,9 @@ rio_srcio_scheduler_reset(struct rio_srcio_scheduler *sched,
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
 		struct rio_worker *worker = workers + i;
-		/* XXX: Unlocked, but it's probably good enough. */
 		u_int qlen = worker->rw_len;
 		bool affine = bit_test(waff, worker->rw_id);
 
-		/* TODO: consider which workers are running? */
 		rio_selector_insert(sel, qlen, affine);
 	}
 	MPASS(sel->rs_n == len);
@@ -2352,7 +2359,6 @@ rio_srcio_scheduler_depth(struct rio_srcio_scheduler *sched,
 	struct rio_selector *sel = &sched->rss_sel;
 	u_int count, idx;
 
-	/* TODO: policy depth threshold to consider remote workers */
 	count = 0;
 	bit_foreach(sel->rs_minimum, sel->rs_n, idx) {
 		sel->rs_indices[count++] = idx;
@@ -2402,29 +2408,6 @@ rio_srcio_scheduler_destroy(struct rio_srcio_scheduler *sched)
 	rio_selector_destroy(&sched->rss_sel);
 }
 
-/* TODO: remote flow selection process */
-/*
- * Rough outline of the process:
- *
- * local_node = cpuset_domain[PCPU_GET(domain)]
- *
- * If all local flow queue depths exceed policy threshold:
- *
- * CPU_FOREACH_ISSET(cpu, local_node)
- *     try to find a suitable near flow
- *
- * If all near flow queue depths exceed policy threshold:
- *
- * CPU_FOREACH_ISCLR(cpu, local_node)
- *     if cpu >= mp_ncpus
- *         break
- *     try to find a suitable far flow
- *
- * If all exceed policy for selection, pick the minimum?  Local preference?
- *
- * Vnet flow affinity also is an available factor.
- */
-
 struct rio_socket_issuer {
 	struct rio_srcio_scheduler	rsi_sched;
 	struct mtx	rsi_lock;
@@ -2463,6 +2446,7 @@ rio_socket_schedule(struct socket *so, sb_which which)
 	MPASS(srcio != NULL);
 	RIO_SOCK_BUF_UNLOCK(so, which);
 	rse = rio_srcio_ext(srcio);
+	/* TODO: Utilize policy/vnet affinity for overflow to remote workers? */
 	flow = DPCPU_ID_PTR(rse->rse_cpu, rio_flow);
 	mtx_lock(&rsi->rsi_lock);
 	worker = rio_srcio_scheduler_select_worker(&rsi->rsi_sched,
