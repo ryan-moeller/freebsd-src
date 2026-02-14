@@ -756,18 +756,14 @@ static inline void
 rio_issuer_enqueue(struct rio_issuer *issuer, struct rio_src *src)
 {
 	int idx;
-	bool wake;
 
 	/* Refill attention credits when enqueued to the back. */
 	src->rs_attention = rio_attention_span;
 	mtx_lock(&issuer->ri_lock);
-	wake = STAILQ_EMPTY(&issuer->ri_srcs);
 	STAILQ_INSERT_TAIL(&issuer->ri_srcs, src, rs_srcs);
 	issuer->ri_len++;
 	idx = rio_issuer_kick_check(issuer);
-	if (wake) {
-		cv_signal(&issuer->ri_cond);
-	}
+	cv_signal_any(&issuer->ri_cond);
 	mtx_unlock(&issuer->ri_lock);
 	if (idx != -1) {
 		rio_issuer_kick(issuer, idx);
@@ -778,18 +774,14 @@ static inline void
 rio_issuer_enqueue_front(struct rio_issuer *issuer, struct rio_src *src)
 {
 	int idx;
-	bool wake;
 
 	/* Keep existing credits when enqueued to the front. */
 	src->rs_attention = src->rs_attention;
 	mtx_lock(&issuer->ri_lock);
-	wake = STAILQ_EMPTY(&issuer->ri_srcs);
 	STAILQ_INSERT_HEAD(&issuer->ri_srcs, src, rs_srcs);
 	issuer->ri_len++;
 	idx = rio_issuer_kick_check(issuer);
-	if (wake) {
-		cv_signal(&issuer->ri_cond);
-	}
+	cv_signal_any(&issuer->ri_cond);
 	mtx_unlock(&issuer->ri_lock);
 	if (idx != -1) {
 		rio_issuer_kick(issuer, idx);
@@ -1867,17 +1859,14 @@ struct rio_worker {
 static inline void
 rio_worker_enqueue(struct rio_worker *worker, struct rio_srcio *srcio)
 {
-	bool wake, kick;
+	bool kick;
 
 	mtx_lock(&worker->rw_lock);
-	wake = STAILQ_EMPTY(&worker->rw_srcios);
 	STAILQ_INSERT_TAIL(&worker->rw_srcios, srcio, rs_srcios);
 	worker->rw_len++;
-	if (wake) {
-		cv_signal(&worker->rw_cond);
-	}
 	kick = !worker->rw_running;
 	worker->rw_running = true;
+	cv_signal(&worker->rw_cond);
 	mtx_unlock(&worker->rw_lock);
 	if (kick) {
 		taskqueue_enqueue(rio_kick, &worker->rw_task);
@@ -2066,6 +2055,8 @@ rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
 }
 
 /* TODO: NUMA domain awareness */
+
+/* TODO: work stealing - but never steal from a flow with idle issuers */
 
 /*
  * Source Scheduler: Soft Affinity
@@ -2477,6 +2468,9 @@ rio_issuer_thread(void *arg)
 next:
 		/* TODO: Removal reduces concurrency!  Add an issuing list? */
 		/* TODO: Work stealing! */
+		/* TODO: Maybe the solution is actually to rerun the policy?
+		 * Then we have a tradeoff on the attention parameter.  It could
+		 * be influenced by mp_ncpus/sqlen? */
 		if (__predict_false(rio_issuer_dequeue(self, &src) != 0)) {
 			break;
 		}
@@ -2589,6 +2583,7 @@ schedule:
 			rio_srcio_scheduler_schedule(&sched, srcio);
 		}
 		sx_sunlock(&sc->sc_status_lock);
+		/* TODO: Select issuer with src policy instead of directly. */
 		rio_issuer_enqueue(self, src);
 	}
 	rio_srcio_scheduler_destroy(&sched);
