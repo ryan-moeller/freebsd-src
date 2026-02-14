@@ -889,6 +889,7 @@ MLINKS+=condvar.9 cv_broadcast.9 \
 	condvar.9 cv_destroy.9 \
 	condvar.9 cv_init.9 \
 	condvar.9 cv_signal.9 \
+	condvar.9 cv_signal_any.9 \
 	condvar.9 cv_timedwait.9 \
 	condvar.9 cv_timedwait_sig.9 \
 	condvar.9 cv_timedwait_sig_sbt.9 \

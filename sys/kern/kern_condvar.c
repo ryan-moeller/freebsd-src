@@ -50,7 +50,7 @@
 
 /*
  * A bound below which cv_waiters is valid.  Once cv_waiters reaches this bound,
- * cv_signal must manually check the wait queue for threads.
+ * _cv_signal must manually check the wait queue for threads.
  */
 #define	CV_WAITERS_BOUND	INT_MAX
 
@@ -99,10 +99,10 @@ cv_destroy(struct cv *cvp)
 
 /*
  * Wait on a condition variable.  The current thread is placed on the condition
- * variable's wait queue and suspended.  A cv_signal or cv_broadcast on the same
- * condition variable will resume the thread.  The mutex is released before
+ * variable's wait queue and suspended.  A _cv_signal or cv_broadcast on the
+ * same condition variable will resume the thread.  The mutex is released before
  * sleeping and will be held on return.  It is recommended that the mutex be
- * held when cv_signal or cv_broadcast are called.
+ * held when _cv_signal or cv_broadcast are called.
  */
 void
 _cv_wait(struct cv *cvp, struct lock_object *lock)
@@ -220,7 +220,7 @@ _cv_wait_unlock(struct cv *cvp, struct lock_object *lock)
 
 /*
  * Wait on a condition variable, allowing interruption by signals.  Return 0 if
- * the thread was resumed with cv_signal or cv_broadcast, EINTR or ERESTART if
+ * the thread was resumed with _cv_signal or cv_broadcast, EINTR or ERESTART if
  * a signal was caught.  If ERESTART is returned the system call should be
  * restarted if possible.
  */
@@ -289,7 +289,7 @@ _cv_wait_sig(struct cv *cvp, struct lock_object *lock)
 
 /*
  * Wait on a condition variable for (at most) the value specified in sbt
- * argument. Returns 0 if the process was resumed by cv_signal or cv_broadcast,
+ * argument. Returns 0 if the process was resumed by _cv_signal or cv_broadcast,
  * EWOULDBLOCK if the timeout expires.
  */
 int
@@ -358,7 +358,7 @@ _cv_timedwait_sbt(struct cv *cvp, struct lock_object *lock, sbintime_t sbt,
 /*
  * Wait on a condition variable for (at most) the value specified in sbt 
  * argument, allowing interruption by signals.
- * Returns 0 if the thread was resumed by cv_signal or cv_broadcast,
+ * Returns 0 if the thread was resumed by _cv_signal or cv_broadcast,
  * EWOULDBLOCK if the timeout expires, and EINTR or ERESTART if a signal
  * was caught.
  */
@@ -431,8 +431,8 @@ _cv_timedwait_sig_sbt(struct cv *cvp, struct lock_object *lock,
  * also result in additional threads being made runnable.  Should be called with
  * the same mutex as was passed to cv_wait held.
  */
-void
-cv_signal(struct cv *cvp)
+static inline void
+_cv_signal(struct cv *cvp, int flags)
 {
 	if (cvp->cv_waiters == 0)
 		return;
@@ -447,8 +447,20 @@ cv_signal(struct cv *cvp)
 	} else {
 		if (cvp->cv_waiters < CV_WAITERS_BOUND)
 			cvp->cv_waiters--;
-		sleepq_signal(cvp, SLEEPQ_CONDVAR | SLEEPQ_DROP, 0, 0);
+		sleepq_signal(cvp, SLEEPQ_CONDVAR | SLEEPQ_DROP | flags, 0, 0);
 	}
+}
+
+void
+cv_signal(struct cv *cvp)
+{
+	_cv_signal(cvp, 0);
+}
+
+void
+cv_signal_any(struct cv *cvp)
+{
+	_cv_signal(cvp, SLEEPQ_UNFAIR);
 }
 
 /*

@@ -57,6 +57,7 @@ int	_cv_timedwait_sig_sbt(struct cv *cvp, struct lock_object *lock,
 	    sbintime_t sbt, sbintime_t pr, int flags);
 
 void	cv_signal(struct cv *cvp);
+void	cv_signal_any(struct cv *cvp);
 void	cv_broadcastpri(struct cv *cvp, int pri);
 
 #define	cv_wait(cvp, lock)						\

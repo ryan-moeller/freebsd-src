@@ -24,7 +24,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 .\" DAMAGE.
 .\"
-.Dd February 19, 2013
+.Dd February 14, 2026
 .Dt CONDVAR 9
 .Os
 .Sh NAME
@@ -39,6 +39,7 @@
 .Nm cv_timedwait_sig ,
 .Nm cv_timedwait_sig_sbt ,
 .Nm cv_signal ,
+.Nm cv_signal_any ,
 .Nm cv_broadcast ,
 .Nm cv_broadcastpri ,
 .Nm cv_wmesg
@@ -70,6 +71,8 @@
 .Ft void
 .Fn cv_signal "struct cv *cvp"
 .Ft void
+.Fn cv_signal_any "struct cv *cvp"
+.Ft void
 .Fn cv_broadcast "struct cv *cvp"
 .Ft void
 .Fn cv_broadcastpri "struct cv *cvp" "int pri"
@@ -99,6 +102,8 @@ or
 .Fn cv_timedwait_sig .
 Threads unblock waiters by calling
 .Fn cv_signal
+or
+.Fn cv_signal_any
 to unblock one waiter, or
 .Fn cv_broadcast
 or
@@ -194,7 +199,8 @@ return prematurely with a value of
 or
 .Er ERESTART
 if a signal is caught, or 0 if signaled via
-.Fn cv_signal
+.Fn cv_signal ,
+.Fn cv_signal_any ,
 or
 .Fn cv_broadcast .
 .Pp
@@ -256,4 +262,5 @@ Timeout expired.
 .Xr rwlock 9 ,
 .Xr sema 9 ,
 .Xr sleep 9 ,
-.Xr sx 9
+.Xr sx 9 ,
+.Xr wakeup_any 9
