@@ -2016,6 +2016,17 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 	}
 }
 
+static inline ssize_t
+rio_flow_score(u_int cpu, bitstr_t *waff)
+{
+	size_t start = cpu * rio_max_flow_workers;
+	size_t end = start + rio_max_flow_workers;
+	ssize_t score;
+
+	bit_count(waff, start, end, &score);
+	return (score);
+}
+
 static inline void
 rio_src_scheduler_init(struct rio_src_scheduler *sched)
 {
@@ -2025,118 +2036,118 @@ rio_src_scheduler_init(struct rio_src_scheduler *sched)
 	mtx_init(&sched->rss_lock, "rio src scheduler lock", NULL, MTX_DEF);
 }
 
-static inline void
-rio_src_scheduler_reset(struct rio_src_scheduler *sched, struct rio_src *src)
+static inline bool
+rio_src_scheduler_local_flow_preferable(void)
 {
-	struct rio_selector *sel = &sched->rss_sel;
-	struct rio_softc *sc = src->rs_sc;
-	bitstr_t *waff = sc->sc_vmspace->vm_rio;
+	struct rio_flow *flow = DPCPU_PTR(rio_flow);
+	u_int level = flow->rf_issuer.ri_len;
+	u_int watermark = 0;
 	u_int cpu;
 
-	mtx_assert(&sched->rss_lock, MA_OWNED);
-	rio_selector_reset(sel);
-	memset(sched->rss_affscore, 0, mp_ncpus * sizeof(*sched->rss_affscore));
+	if (level < rio_flow_issuer_threads) {
+		return (true);
+	}
 	CPU_FOREACH(cpu) {
 		struct rio_flow *flow = DPCPU_ID_PTR(cpu, rio_flow);
-		struct rio_issuer *issuer = &flow->rf_issuer;
-		const size_t start = cpu * rio_max_flow_workers;
-		const size_t end = start + rio_max_flow_workers;
-		u_int qlen = issuer->ri_len;
-		u_int score = 0;
-		size_t id;
 
-		bit_foreach_at(waff, start, end, id) {
-			score++;
-		}
-		sched->rss_affscore[cpu] = score;
-		rio_selector_insert(sel, qlen, score > 0);
+		watermark += flow->rf_issuer.ri_len;
 	}
-	MPASS(sel->rs_min != UINT_MAX);
+	return (level * mp_ncpus <= watermark);
 }
-
-/* TODO: NUMA domain awareness */
-
-/* TODO: work stealing - but never steal from a flow with idle issuers */
 
 /*
  * Source Scheduler: Soft Affinity
  *
- * The Soft Affinity scheduler peferentially selects the local flow until a high
- * water mark is reached.  Then, the least busy remote flow with the most affine
- * workers for the vmspace is selected.  Ties are resolved round-robin.
+ * The Soft Affinity scheduler prefers locality until worker activity reaches a
+ * high water mark.  Then, the least busy remote flow in the local domain with
+ * the most affine workers for the vmspace is selected.  Ties are resolved
+ * round-robin.
  */
 static u_int
 rio_src_scheduler_soft_affinity(struct rio_src *src)
 {
-	struct rio_softc *sc = src->rs_sc;
-	struct rio_src_scheduler *sched = &sc->sc_sched;
-	struct rio_selector *sel = &sched->rss_sel;
-	struct rio_flow *flow;
-	/* TODO: policy */
-	u_int watermark;
-
-	/* Use the mean as our watermark for now. */
-	bit_count(sc->sc_vmspace->vm_rio, 0, rio_max_workers, &watermark);
-	watermark /= mp_ncpus;
-	flow = DPCPU_PTR(rio_flow);
-	if (flow->rf_issuer.ri_len > watermark) {
-		u_int max, count, cpu;
-		u_int stop = sel->rs_n - 1;
-
-		mtx_lock(&sched->rss_lock);
-		rio_src_scheduler_reset(sched, src);
-		max = 0;
-		bit_foreach(sel->rs_minimum, sel->rs_n, cpu) {
-			u_int score = sched->rss_affscore[cpu];
-
-			if (score < max || cpu == curcpu) {
-				continue;
-			}
-			if (score > max) {
-				max = score;
-				bit_nclear(sel->rs_candidates, 0, stop);
-			}
-			bit_set(sel->rs_candidates, cpu);
-		}
-		count = 0;
-		bit_foreach(sel->rs_candidates, sel->rs_n, cpu) {
-			sel->rs_indices[count++] = cpu;
-		}
-		MPASS(count > 0);
-		/* TODO: stride */
-		cpu = sel->rs_indices[sched->rss_phase++ % count];
-		mtx_unlock(&sched->rss_lock);
-		return (cpu);
+	/* Use the local flow if it's not too busy. */
+	if (rio_src_scheduler_local_flow_preferable()) {
+		return (curcpu);
 	}
-	return (curcpu);
+	/* Fall back to the least busy remote flow in the local domain. */
+	return (rio_src_scheduler_least_loaded(src));
 }
+
+#define curdomain pcpu_find(curcpu)->pc_domain
 
 /*
  * Source Scheduler: Least Loaded
  *
- * The Least Loaded scheduler selects the flow with the shallowest issuer queue.
- * Ties are resolved round-robin from the flows with affine workers or from all
- * flows if none are affine.
+ * The Least Loaded scheduler selects the flow in the local domain with the
+ * shallowest issuer queue.  Ties are resolved round-robin from the flows with
+ * affine workers or from all domain-local flows if none are affine.
+ *
+ * TODO: Additional preference for flows with *running* issuers.
  */
 static u_int
 rio_src_scheduler_least_loaded(struct rio_src *src)
 {
 	struct rio_src_scheduler *sched = &src->rs_sc->sc_sched;
 	struct rio_selector *sel = &sched->rss_sel;
-	u_int count, cpu;
+	bitstr_t *waff = src->rs_sc->sc_vmspace->vm_rio; /* worker affinity */
+	int local_domain = curdomain;
+	u_int count, cpu, stop, max;
 
 	mtx_lock(&sched->rss_lock);
-	rio_src_scheduler_reset(sched, src);
-	bit_and(sel->rs_affine, sel->rs_minimum, sel->rs_candidates, sel->rs_n);
+	rio_selector_reset(sel);
+	CPU_FOREACH(cpu) {
+		struct rio_flow *flow = DPCPU_ID_PTR(cpu, rio_flow);
+		struct rio_issuer *issuer = &flow->rf_issuer;
+		ssize_t flow_score;
+
+		if (pcpu_find(cpu)->pc_domain != local_domain) {
+			continue;
+		}
+		flow_score = rio_flow_score(cpu, waff);
+		rio_selector_insert(sel, issuer->ri_len, flow_score > 0);
+		sched->rss_affscore[cpu] = flow_score;
+	}
+	MPASS(sel->rs_min != UINT_MAX);
+	/* Look for the best candidates for round-robin. */
 	count = 0;
+	/* The ideal candidates are affine and idle. */
+	bit_and(sel->rs_affine, sel->rs_empty, sel->rs_candidates, sel->rs_n);
 	bit_foreach(sel->rs_candidates, sel->rs_n, cpu) {
 		sel->rs_indices[count++] = cpu;
 	}
-	if (count == 0) {
-		bit_foreach(sel->rs_minimum, sel->rs_n, cpu) {
-			sel->rs_indices[count++] = cpu;
-		}
+	if (count > 0) {
+		goto rr;
 	}
+	/* Next best are any idle flows. */
+	bit_foreach(sel->rs_empty, sel->rs_n, cpu) {
+		sel->rs_indices[count++] = cpu;
+	}
+	if (count > 0) {
+		goto rr;
+	}
+	/*
+	 * If no flows are idle, select from the eligible flows with minimum
+	 * queue depth and maximum affinity.
+	 */
+	stop = sel->rs_n - 1;
+	max = 0;
+	bit_foreach(sel->rs_minimum, sel->rs_n, cpu) {
+		u_int score = sched->rss_affscore[cpu];
+
+		if (score < max) {
+			continue;
+		}
+		if (score > max) {
+			max = score;
+			bit_nclear(sel->rs_candidates, 0, stop);
+		}
+		bit_set(sel->rs_candidates, cpu);
+	}
+	bit_foreach(sel->rs_candidates, sel->rs_n, cpu) {
+		sel->rs_indices[count++] = cpu;
+	}
+rr:
 	MPASS(count > 0);
 	/* TODO: stride */
 	cpu = sel->rs_indices[sched->rss_phase++ % count];
@@ -2147,19 +2158,26 @@ rio_src_scheduler_least_loaded(struct rio_src *src)
 /*
  * Source Scheduler: Round Robin
  *
- * Flows are selected sequentially.  Why use many rule when one do trick?
+ * Flows are selected sequentially from the local domain.  Why use many rule
+ * when one do trick?
  */
 static u_int
 rio_src_scheduler_round_robin(struct rio_src *src)
 {
 	struct rio_src_scheduler *sched = &src->rs_sc->sc_sched;
-	int phase;
+	struct rio_selector *sel = &sched->rss_sel;
+	cpuset_t *domain = &cpuset_domain[curdomain];
+	u_int cpu, count = 0;
 
 	mtx_lock(&sched->rss_lock);
-	phase = sched->rss_phase++;
-	mtx_unlock(&sched->rss_lock);
+	CPU_FOREACH_ISSET(cpu, domain) {
+		sel->rs_indices[count++] = cpu;
+	}
+	MPASS(count > 0);
 	/* TODO: stride */
-	return (phase % mp_ncpus);
+	cpu = sel->rs_indices[sched->rss_phase++ % count];
+	mtx_unlock(&sched->rss_lock);
+	return (cpu);
 }
 
 /*
@@ -2217,11 +2235,11 @@ rio_schedule(struct rio_softc *sc)
  * XXX: Scheduling avoids locking every worker so may see stale reads, but it's
  * good enough for the purpose of load balancing.
  *
- * TODO: The srcio schedulers currently only utilize the local flow, so a source
- * submit with a full submission ring gets scheduled to one flow and will not
- * utilize available capacity from other flows.  The scheduling algorithm needs
- * to be extended with overflow to remote workers in the issuing stage, not just
- * at source ring submit.
+ * One relief is that when a CPU is busy running workers, the user thread will
+ * tend to migrate to a less busy CPU so the next submission batch will utilize
+ * a different flow.  In that way, a single-threaded application can still
+ * utilize multiple cores for I/O execution in the kernel, as long as it keeps
+ * up with completions.
  */
 struct rio_srcio_scheduler {
 	struct rio_selector	rss_sel;
@@ -2467,7 +2485,6 @@ rio_issuer_thread(void *arg)
 		struct thread *td;
 next:
 		/* TODO: Removal reduces concurrency!  Add an issuing list? */
-		/* TODO: Work stealing! */
 		/* TODO: Maybe the solution is actually to rerun the policy?
 		 * Then we have a tradeoff on the attention parameter.  It could
 		 * be influenced by mp_ncpus/sqlen? */
@@ -2614,7 +2631,6 @@ rio_worker_proc(void *arg)
 		enum rio_status status;
 		int error;
 
-		/* TODO: Work stealing! */
 		/*
 		 * Why not have one queue per worker class in each flow, and
 		 * have workers take from there instead of each having its own
