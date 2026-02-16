@@ -213,11 +213,10 @@ ATF_TC_HEAD(saturation, tc)
 
 ATF_TC_BODY(saturation, tc)
 {
-	const int limit = 1000;
 	const struct timespec deadline = {0};
 	struct riocb iocb = {0};
 	rio_t rio = NULL;
-	int fd, q, s, c;
+	int fd;
 
 	ATF_REQUIRE(CQLEN <= SQLEN);
 	ATF_REQUIRE(rio_create(&rio, TESTCONFIG) != -1);
@@ -228,69 +227,60 @@ ATF_TC_BODY(saturation, tc)
 	iocb.rio_buf = __DECONST(char *, "test");
 	iocb.rio_length = 4;
 	/* TODO: Test with multiple threads and different qlens/ncb. */
-	q = s = c = 0;
-	while (s < limit) {
-		ATF_REQUIRE(q == s);
-		ATF_REQUIRE(s == c);
+	for (int i = 0; i < 100; i++) {
 		/* Non-blocking enqueue, submit when full. */
-		for (; q - s < SQLEN - 1; q++) {
+		for (int j = 1; j < SQLEN; j++) {
 			ATF_CHECK(rio_write(rio, &iocb, &deadline) != -1);
 		}
-		if (s == 0) {
+		if (i == 0) {
 			/* Submission queue full on first iteration. */
 			ATF_CHECK(rio_write(rio, &iocb, &deadline) == -1);
 			ATF_CHECK_INTEQ(errno, ETIMEDOUT);
 		}
 		ATF_CHECK(rio_submit(rio) != -1);
-		s = q;
 		/*
 		 * Blocking enqueue, submit when full again.  The completion
 		 * ring size will make space available in the submission ring.
+		 *
+		 * CQLEN <= SQLEN asserted at top of test.
 		 */
-		for (; q - s < CQLEN - 1; q++) {
+		for (int j = 1; j < CQLEN; j++) {
 			ATF_CHECK(rio_fsync(rio, &iocb, NULL) != -1);
 		}
-		/* Submissions full. */
+		/*
+		 * Submission dequeue is blocked by full completions, so
+		 * submission enqueue is also blocked on the submission ring.
+		 */
 		ATF_CHECK(rio_fsync(rio, &iocb, &deadline) == -1);
 		ATF_CHECK_INTEQ(errno, ETIMEDOUT);
 		/* Can submit, but we're immediately kicked off the issuer. */
 		ATF_CHECK(rio_submit(rio) != -1);
-		s = q;
 		/*
-		 * The submissions being full is our hint to drain completions.
-		 */
-		while (s - c > CQLEN - 1) {
-			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
-			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
-			ATF_CHECK_INTEQ(iocb.rio_error, 0);
-			c++;
-		}
-		/*
-		 * We were kicked off the issuer for not draining completions
-		 * earlier, so the queue must be resubmit before it starts
-		 * being issued.
+		 * We are or will be kicked off the issuer for not draining
+		 * completions earlier, so the queue must be resubmit before it
+		 * starts being issued.
+		 *
+		 * XXX: This check ensures that the kernel has not removed any
+		 * submissions, but does not guarantee that we have been
+		 * descheduled yet.  The source "is or will be" descheduled.
 		 */
 		ATF_CHECK(rio_read(rio, &iocb, &deadline) == -1);
 		ATF_CHECK_INTEQ(errno, ETIMEDOUT);
-		ATF_CHECK(rio_submit(rio) != -1);
-		s = q;
 		/* We have to keep polling to make progress. */
-		while (s - c > 0) {
+		for (int j = 1; j < CQLEN; j++) {
 			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
 			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
 			ATF_CHECK_INTEQ(iocb.rio_error, 0);
-			c++;
+		}
+		/* Now we have made space for the kernel to pull submissions. */
+		ATF_CHECK(rio_submit(rio) != -1);
+		/* Drain remaining completions. */
+		for (int j = 1; j < SQLEN; j++) {
+			ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
+			ATF_CHECK_INTEQ(iocb.rio_ident, fd);
+			ATF_CHECK_INTEQ(iocb.rio_error, 0);
 		}
 	}
-	/* Drain remaining completions. */
-	while (s > c) {
-		ATF_CHECK(rio_poll(rio, &iocb, NULL) != -1);
-		ATF_CHECK_INTEQ(iocb.rio_ident, fd);
-		ATF_CHECK_INTEQ(iocb.rio_error, 0);
-		c++;
-	}
-	ATF_CHECK(q == s);
-	ATF_CHECK(s == c);
 
 	ATF_CHECK(close(fd) != -1);
 	rio_destroy(rio);
