@@ -909,6 +909,10 @@ rio_file_srcio_zone(struct file *fp)
 	return (rio_srcio_zone);
 }
 
+static counter_u64_t rio_num_inflight;
+SYSCTL_COUNTER_U64(_kern_rio, OID_AUTO, num_inflight, CTLFLAG_RD,
+    &rio_num_inflight, "Number of in-flight RIO commands");
+
 static inline struct rio_srcio *
 rio_srcio_new(struct rio_softc *sc, struct rio_io *io)
 {
@@ -926,6 +930,7 @@ rio_srcio_new(struct rio_softc *sc, struct rio_io *io)
 		rse->rse_cpu = curcpu;
 		rse->rse_charge = false;
 	}
+	counter_u64_add(rio_num_inflight, 1);
 	return (srcio);
 }
 
@@ -944,6 +949,7 @@ rio_srcio_free(struct rio_srcio *srcio, uma_zone_t zone)
 		freeuio(srcio->rs_uio);
 	}
 	uma_zfree(zone, srcio);
+	counter_u64_add(rio_num_inflight, -1);
 }
 
 static inline uint32_t
@@ -1006,6 +1012,15 @@ rio_srcio_vmspace_switch(struct rio_srcio *srcio, u_int id)
 	rio_vmspace_switch(rio_srcio_vmspace(srcio), id);
 }
 
+static counter_u64_t rio_num_bufs;
+SYSCTL_COUNTER_U64(_kern_rio, OID_AUTO, num_bufs, CTLFLAG_RD, &rio_num_bufs,
+    "Number of in-flight RIO commands using the buf(9) subsystem");
+
+static counter_u64_t rio_num_unmapped;
+SYSCTL_COUNTER_U64(_kern_rio, OID_AUTO, num_unmapped, CTLFLAG_RD,
+    &rio_num_unmapped,
+    "Number of in-flight RIO commands using unmapped buffers");
+
 static inline int
 rio_bio_bufsetup(struct bio *bp, struct cdev *dev, vm_map_t map, void *buf,
     size_t len)
@@ -1046,13 +1061,13 @@ rio_bio_bufsetup(struct bio *bp, struct cdev *dev, vm_map_t map, void *buf,
 		bp->bio_ma_offset = pgoff;
 		bp->bio_data = unmapped_buf;
 		bp->bio_flags = BIO_UNMAPPED;
-		/* TODO: accounting a la aio num_unmapped_aio */
+		counter_u64_add(rio_num_unmapped, 1);
 	} else {
 		pmap_qenter((vm_offset_t)pbuf->b_data, pages, npages);
 		bp->bio_data = pbuf->b_data + pgoff;
 		bp->bio_caller2 = pbuf;
 		pbuf->b_npages = npages;
-		/* TODO: accounting a la aio num_buf_aio */
+		counter_u64_add(rio_num_bufs, 1);
 	}
 	return (0);
 }
@@ -1070,14 +1085,14 @@ rio_bio_destroy(struct bio *bp)
 		pmap_qremove((vm_offset_t)pbuf->b_data, npages);
 		vm_page_unhold_pages(pbuf->b_pages, npages);
 		uma_zfree(pbuf_zone, pbuf);
-		/* TODO: accounting a la aio num_buf_aio */
+		counter_u64_add(rio_num_bufs, -1);
 	} else if (pages != NULL) {
 		int npages = bp->bio_ma_n;
 
 		MPASS(npages <= atop(maxphys) + 1);
 		vm_page_unhold_pages(pages, npages);
 		free(pages, M_TEMP);
-		/* TODO: accounting a la aio num_unmapped_aio */
+		counter_u64_add(rio_num_unmapped, -1);
 	}
 	g_destroy_bio(bp);
 }
@@ -1565,6 +1580,16 @@ rio_sockbuf_takefirst(struct sockbuf *sb)
 #define RIO_SOCK_BUF_UNLOCK		SOCK_BUF_UNLOCK
 #endif
 
+static counter_u64_t rio_sockbuf_empty_wakeups;
+SYSCTL_COUNTER_U64(_kern_rio, OID_AUTO, sockbuf_empty_wakeups, CTLFLAG_RD,
+    &rio_sockbuf_empty_wakeups,
+    "Number of times socket send/recv blocked with no progress");
+
+static counter_u64_t rio_sockbuf_empty_retries;
+SYSCTL_COUNTER_U64(_kern_rio, OID_AUTO, sockbuf_empty_retries, CTLFLAG_RD,
+    &rio_sockbuf_empty_retries,
+    "Number of times socket send/recv immediately retried after being blocked");
+
 static inline struct rio_srcio_ext *
 rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 {
@@ -1645,12 +1670,10 @@ rio_srcio_ext_sockbuf(struct rio_srcio_ext *rse, sb_which which)
 		struct riocb *iocb;
 
 		RIO_SOCK_BUF_LOCK(so, which);
-		/* TODO: empty counter */
-		printf("%s: empty\n", __func__);
+		counter_u64_add(rio_sockbuf_empty_wakeups, 1);
 		if (rio_soready(so, which)) {
 			/* Readied up while waiting for lock. */
-			/* TODO: retry counter */
-			printf("%s: retry\n", __func__);
+			counter_u64_add(rio_sockbuf_empty_retries, 1);
 			return (rse);
 		}
 		iocb = rio_srcio_iocb(srcio);
@@ -2800,6 +2823,12 @@ rio_bootstrap(void *arg __unused)
 	rio_srcio_ext_zone = rio_zcreate("rio src+io+extra",
 	    sizeof(struct rio_srcio_ext));
 
+	rio_num_inflight = counter_u64_alloc(M_WAITOK);
+	rio_num_bufs = counter_u64_alloc(M_WAITOK);
+	rio_num_unmapped = counter_u64_alloc(M_WAITOK);
+	rio_sockbuf_empty_wakeups = counter_u64_alloc(M_WAITOK);
+	rio_sockbuf_empty_retries = counter_u64_alloc(M_WAITOK);
+
 	cv_init(&rio_shutdown_cond, "rio shutdown cond");
 
 	CPU_FOREACH(cpu) {
@@ -2942,6 +2971,11 @@ rio_shutdown(void)
 	taskqueue_free(rio_doom);
 	taskqueue_quiesce(rio_kick);
 	taskqueue_free(rio_kick);
+	counter_u64_free(rio_num_inflight);
+	counter_u64_free(rio_num_bufs);
+	counter_u64_free(rio_num_unmapped);
+	counter_u64_free(rio_sockbuf_empty_wakeups);
+	counter_u64_free(rio_sockbuf_empty_retries);
 	uma_zdestroy(rio_src_zone);
 	uma_zdestroy(rio_srcio_zone);
 	uma_zdestroy(rio_srcio_ext_zone);
