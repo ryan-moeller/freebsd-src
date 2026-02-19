@@ -2225,20 +2225,27 @@ rio_src_scheduler_destroy(struct rio_src_scheduler *sched)
 }
 
 static inline void
-rio_schedule(struct rio_softc *sc)
+rio_src_schedule(struct rio_src *src)
 {
-	struct rio_src *src;
 	struct rio_flow *flow;
 	rio_src_scheduler_f *schedule;
 	u_int cpu;
 
-	src = uma_zalloc(rio_src_zone, M_WAITOK);
-	src->rs_sc = sc;
-	schedule = rio_src_policies[sc->sc_config.rio_policy_id];
+	schedule = rio_src_policies[src->rs_sc->sc_config.rio_policy_id];
 	cpu = schedule(src);
 	MPASS(cpu < mp_ncpus);
 	flow = DPCPU_ID_PTR(cpu, rio_flow);
 	rio_issuer_enqueue(&flow->rf_issuer, src);
+}
+
+static inline void
+rio_schedule(struct rio_softc *sc)
+{
+	struct rio_src *src;
+
+	src = uma_zalloc(rio_src_zone, M_WAITOK);
+	src->rs_sc = sc;
+	rio_src_schedule(src);
 }
 
 /*
@@ -2585,7 +2592,7 @@ next:
 			/* Try the async BIO strategy if available. */
 			switch ((error = rio_cdev_setup(&rcd, srcio))) {
 			case RIO_CDEV_FALLBACK:
-				goto schedule;
+				goto schedule_srcio;
 			case 0:
 				if (rcd.rcd_iovcnt > 0) {
 					/*
@@ -2603,7 +2610,7 @@ next:
 			}
 			switch ((error = rio_cdev_bio_strategy(&rcd, srcio))) {
 			case RIO_CDEV_FALLBACK:
-				goto schedule;
+				goto schedule_srcio;
 			default:
 				rio_srcio_error(srcio, error);
 				/* FALLTHROUGH */
@@ -2618,13 +2625,13 @@ next:
 				}
 				continue;
 			}
-schedule:
+schedule_srcio:
 			/* Schedule the io on a worker. */
 			rio_srcio_scheduler_schedule(&sched, srcio);
 		}
 		sx_sunlock(&sc->sc_status_lock);
-		/* TODO: Select issuer with src policy instead of directly. */
-		rio_issuer_enqueue(self, src);
+		/* TODO: Policy for flow stickiness (enqueue to self)? */
+		rio_src_schedule(src);
 	}
 	rio_srcio_scheduler_destroy(&sched);
 	free_unr(self->ri_unr, rio_issuer_arg_idx(ria));
