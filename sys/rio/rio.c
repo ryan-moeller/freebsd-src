@@ -420,8 +420,10 @@ rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
 	uaddr = rio_uaddr(sc, address);
 	/* Wake a single waiter. */
 	if ((error = umtx_wake(sc->sc_proc, uaddr, 1, true)) != 0) {
-		/* TODO: handle error somehow */
-		printf("%s: umtx_wake: error=%d\n", __func__, error);
+		/* The counter must have been unmapped. */
+		MPASS(error == EFAULT);
+		/* The user is misbehaving. */
+		rio_destroy(sc);
 	}
 }
 
