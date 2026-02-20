@@ -206,18 +206,6 @@ rio_vmspace_init(struct vmspace *vm)
 	}
 }
 
-/* TODO: belongs in sys/bitstring.h */
-static inline void
-bit_set_atomic(bitstr_t *bitstr, size_t bit)
-{
-	atomic_set_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
-}
-static inline void
-bit_clear_atomic(bitstr_t *bitstr, size_t bit)
-{
-	atomic_clear_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
-}
-
 static inline void
 rio_vmspace_switch(struct vmspace *vm, u_int id)
 {
