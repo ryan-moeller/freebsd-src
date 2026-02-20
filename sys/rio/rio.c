@@ -332,6 +332,14 @@ rio_close(struct rio_softc *sc)
 	free(sc, M_RIO);
 }
 
+static inline void
+rio_abort(struct rio_softc *sc)
+{
+	/* The user is misbehaving. */
+	kern_psignal(sc->sc_proc, SIGBUS);
+	rio_destroy(sc);
+}
+
 static enum rio_status
 rio_status(struct rio_softc *sc)
 {
@@ -422,8 +430,7 @@ rio_ec_umtx_wake(const struct ck_ec_ops *ops, const uint32_t *address)
 	if ((error = umtx_wake(sc->sc_proc, uaddr, 1, true)) != 0) {
 		/* The counter must have been unmapped. */
 		MPASS(error == EFAULT);
-		/* The user is misbehaving. */
-		rio_destroy(sc);
+		rio_abort(sc);
 	}
 }
 
@@ -452,15 +459,15 @@ rio_submissions_dequeue_locked(struct rio_softc *sc, uint32_t *indexp)
 	}
 	if (CK_RING_DEQUEUE_MPSC(rio, &rio->rio_submission.rr_ring,
 	    sc->sc_submissions, &slot)) {
-		uint32_t index = slot.rs_index;
+		uint32_t index = slot.rs_index; /* XXX: handle with care */
 
 		ck_ec_inc(&rio->rio_submission.rr_dqc, &sc->sc_ec_umtx_mode);
 		if (__predict_true(index < sc->sc_config.rio_ncb)) {
 			*indexp = index;
 			return (&rio->rio_control[index]);
 		}
-		/* TODO: how to handle invalid index? */
 		printf("%s: invalid index %u\n", __func__, index);
+		rio_abort(sc);
 	}
 	return (NULL);
 }
@@ -550,8 +557,7 @@ rio_iocb_complete(struct rio_softc *sc, struct riocb *iocb, int cberror,
 	atomic_thread_fence_rel();
 	error = rio_completions_enqueue(sc, index);
 	if (__predict_false(error == EINVAL)) {
-		/* The user is misbehaving. */
-		rio_destroy(sc);
+		rio_abort(sc);
 	}
 	MPASS(error == 0);
 	if (__predict_false(rio_status(sc) != RIO_OPEN) &&
