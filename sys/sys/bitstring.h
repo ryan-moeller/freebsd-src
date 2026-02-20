@@ -65,6 +65,7 @@
 #ifdef _KERNEL
 #include <sys/libkern.h>
 #include <sys/malloc.h>
+#include <machine/atomic.h>
 #endif
 
 #include <sys/types.h>
@@ -150,6 +151,20 @@ bit_clear(bitstr_t *_bitstr, size_t _bit)
 {
 	_bitstr[_bit_idx(_bit)] &= ~_bit_mask(_bit);
 }
+
+#ifdef _KERNEL
+static inline void
+bit_set_atomic(bitstr_t *bitstr, size_t bit)
+{
+	atomic_set_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
+}
+
+static inline void
+bit_clear_atomic(bitstr_t *bitstr, size_t bit)
+{
+	atomic_clear_long(&bitstr[_bit_idx(bit)], _bit_mask(bit));
+}
+#endif
 
 /* Are bits in [start ... stop] in bit string all 0 or all 1? */
 static inline int
