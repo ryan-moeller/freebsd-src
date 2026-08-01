@@ -1852,7 +1852,7 @@ rio_srcio_socket_enqueue(struct rio_srcio *srcio)
 
 /*
  * A RIO worker is a kernel process pinned to a CPU.  The worker performs
- * blocking IO operations on behalf of a user process.   A worker must be a
+ * blocking IO operations on behalf of a user process.  A worker must be a
  * kernel process with a single thread because it potentially has to change
  * vmspace to perform copies to or from the user process.
  *
