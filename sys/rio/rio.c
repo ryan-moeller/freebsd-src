@@ -195,14 +195,20 @@ static bool rio_shutdown_pending;
 static u_int rio_max_flow_workers;
 static u_int rio_max_workers;
 
+static inline uintptr_t *
+vm_rio_ptr(struct vmspace *vm)
+{
+	return ((uintptr_t *)&vm->vm_rio);
+}
+
 static inline void
 rio_vmspace_init(struct vmspace *vm)
 {
-	bitstr_t *waff; /* worker affinity */
+	bitstr_t *worker_affinity;
 
-	waff = bit_alloc(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
-	if (!atomic_cmpset_ptr((uintptr_t *)&vm->vm_rio, 0, (uintptr_t)waff)) {
-		free(waff, M_RIO);
+	worker_affinity = bit_alloc(rio_max_workers, M_RIO, M_WAITOK | M_ZERO);
+	if (!atomic_cmpset_ptr(vm_rio_ptr(vm), 0, (uintptr_t)worker_affinity)) {
+		free(worker_affinity, M_RIO);
 	}
 }
 
@@ -1994,15 +2000,15 @@ rio_worker_lookup(u_int id)
 void
 rio_vmspace_exit(struct vmspace *vm)
 {
-	bitstr_t *waff; /* worker affinity */
+	bitstr_t *worker_affinity;
 	size_t id;
 
-	waff = (bitstr_t *)atomic_swap_ptr((uintptr_t *)&vm->vm_rio, 0);
-	if (waff == NULL) {
+	worker_affinity = (bitstr_t *)atomic_swap_ptr(vm_rio_ptr(vm), 0);
+	if (worker_affinity == NULL) {
 		return;
 	}
 	/* Signal any sleeping workers using this vmspace. */
-	bit_foreach(waff, rio_max_workers, id) {
+	bit_foreach(worker_affinity, rio_max_workers, id) {
 		struct rio_worker *worker = rio_worker_lookup(id);
 
 		mtx_lock(&worker->rw_lock);
@@ -2011,7 +2017,7 @@ rio_vmspace_exit(struct vmspace *vm)
 		}
 		mtx_unlock(&worker->rw_lock);
 	}
-	free(waff, M_RIO);
+	free(worker_affinity, M_RIO);
 }
 
 #define UIMAX(...) ({ \
@@ -2036,13 +2042,13 @@ bit_and(bitstr_t *a, bitstr_t *b, bitstr_t *r, size_t len)
 }
 
 static inline ssize_t
-rio_flow_score(u_int cpu, bitstr_t *waff)
+rio_flow_score(u_int cpu, bitstr_t *worker_affinity)
 {
 	size_t start = cpu * rio_max_flow_workers;
 	size_t end = start + rio_max_flow_workers;
 	ssize_t score;
 
-	bit_count(waff, start, end, &score);
+	bit_count(worker_affinity, start, end, &score);
 	return (score);
 }
 
@@ -2109,7 +2115,7 @@ rio_src_scheduler_least_loaded(struct rio_src *src)
 {
 	struct rio_src_scheduler *sched = &src->rs_sc->sc_sched;
 	struct rio_selector *sel = &sched->rss_sel;
-	bitstr_t *waff = src->rs_sc->sc_vmspace->vm_rio; /* worker affinity */
+	bitstr_t *worker_affinity = src->rs_sc->sc_vmspace->vm_rio;
 	int local_domain = curdomain;
 	u_int count, cpu, stop, max;
 
@@ -2123,7 +2129,7 @@ rio_src_scheduler_least_loaded(struct rio_src *src)
 		if (pcpu_find(cpu)->pc_domain != local_domain) {
 			continue;
 		}
-		flow_score = rio_flow_score(cpu, waff);
+		flow_score = rio_flow_score(cpu, worker_affinity);
 		rio_selector_insert(sel, issuer->ri_len, flow_score > 0);
 		sched->rss_affscore[cpu] = flow_score;
 	}
@@ -2295,14 +2301,14 @@ rio_srcio_scheduler_reset(struct rio_srcio_scheduler *sched,
 {
 	struct rio_selector *sel = &sched->rss_sel;
 	struct rio_softc *sc = srcio->rs_sc;
-	bitstr_t *waff = sc->sc_vmspace->vm_rio; /* worker affinity */
+	bitstr_t *worker_affinity = sc->sc_vmspace->vm_rio;
 
 	rio_selector_reset(sel);
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
 		struct rio_worker *worker = workers + i;
 		u_int qlen = worker->rw_len;
-		bool affine = bit_test(waff, worker->rw_id);
+		bool affine = bit_test(worker_affinity, worker->rw_id);
 
 		rio_selector_insert(sel, qlen, affine);
 	}
