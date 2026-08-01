@@ -2307,10 +2307,10 @@ rio_srcio_scheduler_reset(struct rio_srcio_scheduler *sched,
 	MPASS(len > 0);
 	for (u_int i = 0; i < len; i++) {
 		struct rio_worker *worker = workers + i;
-		u_int qlen = worker->rw_len;
+		u_int queue_length = worker->rw_len;
 		bool affine = bit_test(worker_affinity, worker->rw_id);
 
-		rio_selector_insert(sel, qlen, affine);
+		rio_selector_insert(sel, queue_length, affine);
 	}
 	MPASS(sel->rs_n == len);
 	MPASS(sel->rs_min != UINT_MAX);
@@ -2362,13 +2362,13 @@ rio_srcio_scheduler_affine(struct rio_srcio_scheduler *sched,
 	bit_nclear(sel->rs_candidates, 0, stop);
 	min = UINT_MAX;
 	bit_foreach(sel->rs_affine, sel->rs_n, idx) {
-		u_int qlen = workers[idx].rw_len;
+		u_int queue_length = workers[idx].rw_len;
 
-		if (qlen > min) {
+		if (queue_length > min) {
 			continue;
 		}
-		if (qlen < min) {
-			min = qlen;
+		if (queue_length < min) {
+			min = queue_length;
 			bit_nclear(sel->rs_candidates, 0, stop);
 		}
 		bit_set(sel->rs_candidates, idx);
