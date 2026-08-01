@@ -1208,8 +1208,8 @@ rio_cdev_setup(struct rio_cdev *rcd, struct rio_srcio *srcio)
 		return (RIO_CDEV_FALLBACK);
 	}
 	if (__predict_false((maxio = dev->si_iosize_max) < PAGE_SIZE)) {
-		printf("WARNING: %s si_iosize_max=%d, using DFLTPHYS.\n",
-		    devtoname(dev), maxio);
+		printf("%s: WARNING: %s si_iosize_max=%d, using DFLTPHYS=%d\n",
+		    __func__, devtoname(dev), maxio, DFLTPHYS);
 		maxio = DFLTPHYS;
 	}
 	rcd->rcd_maxio = MIN(maxio, maxphys);
